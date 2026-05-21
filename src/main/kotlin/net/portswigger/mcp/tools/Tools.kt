@@ -13,7 +13,7 @@ import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.*
 import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.schema.toSerializableForm
 import net.portswigger.mcp.security.HistoryAccessSecurity
@@ -43,9 +43,50 @@ private fun truncateIfNeeded(serialized: String): String {
     }
 }
 
-private fun serializeHttpHistoryItem(index: Int, item: ProxyHttpRequestResponse): String {
-    val serializedItem = Json.encodeToString(item.toSerializableForm())
-    return truncateIfNeeded("{\"index\":$index,\"item\":$serializedItem}")
+private fun firstLine(message: String?): String? {
+    return message?.lineSequence()?.firstOrNull()
+}
+
+private fun bodyPart(message: String?): String {
+    if (message == null) return ""
+    val crlfBodyIndex = message.indexOf("\r\n\r\n")
+    if (crlfBodyIndex >= 0) return message.substring(crlfBodyIndex + 4)
+
+    val lfBodyIndex = message.indexOf("\n\n")
+    if (lfBodyIndex >= 0) return message.substring(lfBodyIndex + 2)
+
+    return message
+}
+
+private fun serializeHttpHistoryItem(
+    index: Int,
+    item: ProxyHttpRequestResponse,
+    fields: List<String>? = null,
+): String {
+    val serializableItem = item.toSerializableForm()
+    val selectedFields = fields?.filter { it.isNotBlank() }?.toSet().takeUnless { it.isNullOrEmpty() }
+    val itemJson = if (selectedFields == null) {
+        Json.encodeToJsonElement(serializableItem)
+    } else {
+        buildJsonObject {
+            if ("request" in selectedFields) put("request", serializableItem.request?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("response" in selectedFields) put("response", serializableItem.response?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("notes" in selectedFields) put("notes", serializableItem.notes?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("requestLine" in selectedFields) put("requestLine", firstLine(serializableItem.request)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("responseLine" in selectedFields) put("responseLine", firstLine(serializableItem.response)?.let { JsonPrimitive(it) } ?: JsonNull)
+        }
+    }
+    return truncateIfNeeded(Json.encodeToString(buildJsonObject {
+        put("index", index)
+        put("item", itemJson)
+    }))
+}
+
+private fun sliceBody(message: String, offset: Int, length: Int): String {
+    val safeOffset = offset.coerceAtLeast(0)
+    val safeLength = length.coerceAtLeast(0)
+    if (safeOffset >= message.length || safeLength == 0) return ""
+    return message.substring(safeOffset, (safeOffset + safeLength).coerceAtMost(message.length))
 }
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
@@ -249,7 +290,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val ordered = if (newestFirst) history.asReversed() else history
         ordered.asSequence().mapIndexed { pageIndex, item ->
             val originalIndex = if (newestFirst) history.size - pageIndex else pageIndex + 1
-            serializeHttpHistoryItem(originalIndex, item)
+            serializeHttpHistoryItem(originalIndex, item, fields)
         }
     }
 
@@ -266,7 +307,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val ordered = if (newestFirst) history.asReversed() else history
         ordered.asSequence().mapIndexed { pageIndex, item ->
             val originalIndex = if (newestFirst) history.size - pageIndex else pageIndex + 1
-            serializeHttpHistoryItem(originalIndex, item)
+            serializeHttpHistoryItem(originalIndex, item, fields)
         }
     }
 
@@ -300,7 +341,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             "Reached end of items"
         } else {
             history.asReversed().take(count).mapIndexed { pageIndex, item ->
-                serializeHttpHistoryItem(history.size - pageIndex, item)
+                serializeHttpHistoryItem(history.size - pageIndex, item, fields)
             }.joinToString(separator = "\n\n")
         }
     }
@@ -317,8 +358,74 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         if (requestResponse == null) {
             "No HTTP history found at $index"
         } else {
-            serializeHttpHistoryItem(index, requestResponse)
+            serializeHttpHistoryItem(index, requestResponse, fields)
         }
+    }
+
+    mcpTool<GetProxyHttpHistorySince>("Displays HTTP history items added after a known 1-based index, optionally with compact fields") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history since index")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val history = api.proxy().history()
+        val startIndex = afterIndex.coerceAtLeast(0)
+        if (startIndex >= history.size) {
+            "Reached end of items"
+        } else {
+            history.drop(startIndex).take(count).mapIndexed { pageIndex, item ->
+                serializeHttpHistoryItem(startIndex + pageIndex + 1, item, fields)
+            }.joinToString(separator = "\n\n")
+        }
+    }
+
+    mcpTool<GetProxyHttpHistoryBody>("Returns a bounded body slice from a proxy HTTP history request or response by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history body")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val requestResponse = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP history found at $index"
+        val serializableItem = requestResponse.toSerializableForm()
+        val selectedMessage = when (message.lowercase()) {
+            "request" -> serializableItem.request
+            "response" -> serializableItem.response
+            else -> return@mcpTool "message must be 'request' or 'response'"
+        }
+        sliceBody(bodyPart(selectedMessage), offset, length)
+    }
+
+    mcpTool<CreateRepeaterTabFromHistory>("Creates a Repeater tab from a proxy HTTP history item by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "create Repeater tab from HTTP history")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val request = api.proxy().history().getOrNull(index - 1)?.request()
+            ?: return@mcpTool "No HTTP request found at history index $index"
+        api.repeater().sendToRepeater(request, tabName)
+        "Created Repeater tab from HTTP history index $index"
+    }
+
+    mcpTool<SendToIntruderFromHistory>("Sends a proxy HTTP history request to Intruder by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "send HTTP history to Intruder")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val request = api.proxy().history().getOrNull(index - 1)?.request()
+            ?: return@mcpTool "No HTTP request found at history index $index"
+        api.intruder().sendToIntruder(request, tabName)
+        "Sent HTTP history index $index to Intruder"
     }
 
     mcpPaginatedTool<GetProxyWebsocketHistory>("Displays items within the proxy WebSocket history") {
@@ -493,19 +600,42 @@ data class SetActiveEditorContents(val text: String)
 data class GetScannerIssues(override val count: Int, override val offset: Int) : Paginated
 
 @Serializable
-data class GetProxyHttpHistory(override val count: Int, override val offset: Int, val newestFirst: Boolean = false) : Paginated
+data class GetProxyHttpHistory(
+    override val count: Int,
+    override val offset: Int,
+    val newestFirst: Boolean = false,
+    val fields: List<String>? = null,
+) : Paginated
 
 @Serializable
-data class GetProxyHttpHistoryRegex(val regex: String, override val count: Int, override val offset: Int, val newestFirst: Boolean = false) : Paginated
+data class GetProxyHttpHistoryRegex(
+    val regex: String,
+    override val count: Int,
+    override val offset: Int,
+    val newestFirst: Boolean = false,
+    val fields: List<String>? = null,
+) : Paginated
 
 @Serializable
 data class GetProxyHttpHistoryCount(val regex: String? = null)
 
 @Serializable
-data class GetLatestProxyHttpHistory(val count: Int = 1)
+data class GetLatestProxyHttpHistory(val count: Int = 1, val fields: List<String>? = null)
 
 @Serializable
-data class GetProxyHttpHistoryByIndex(val index: Int)
+data class GetProxyHttpHistoryByIndex(val index: Int, val fields: List<String>? = null)
+
+@Serializable
+data class GetProxyHttpHistorySince(val afterIndex: Int, val count: Int = 10, val fields: List<String>? = null)
+
+@Serializable
+data class GetProxyHttpHistoryBody(val index: Int, val message: String, val offset: Int = 0, val length: Int = 5000)
+
+@Serializable
+data class CreateRepeaterTabFromHistory(val index: Int, val tabName: String? = null)
+
+@Serializable
+data class SendToIntruderFromHistory(val index: Int, val tabName: String? = null)
 
 @Serializable
 data class GetProxyWebsocketHistory(override val count: Int, override val offset: Int, val newestFirst: Boolean = false) : Paginated

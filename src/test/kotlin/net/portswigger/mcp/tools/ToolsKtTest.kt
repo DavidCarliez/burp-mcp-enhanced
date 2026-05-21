@@ -861,6 +861,167 @@ class ToolsKtTest {
                 assertFalse(text.contains("GET /first"), "Other items should not be returned")
             }
         }
+
+        @Test
+        fun `get latest proxy http history should support compact field selection`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /login HTTP/1.1\r\nHost: example.com\r\n\r\nsecret=body",
+                response = "HTTP/1.1 302 Found\r\nLocation: /home\r\n\r\nlarge response body",
+                notes = "interesting"
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_latest_proxy_http_history", mapOf(
+                        "count" to 1,
+                        "fields" to listOf("requestLine", "responseLine", "notes")
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("POST /login HTTP/1.1"), "Request line should be returned")
+                assertTrue(text.contains("HTTP/1.1 302 Found"), "Response line should be returned")
+                assertTrue(text.contains("interesting"), "Selected notes field should be returned")
+                assertFalse(text.contains("secret=body"), "Full request body should not be returned")
+                assertFalse(text.contains("large response body"), "Full response body should not be returned")
+            }
+        }
+
+        @Test
+        fun `get proxy http history since should return entries after a known index`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>()
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /after-two HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /after-three HTTP/1.1",
+                response = "HTTP/1.1 201 Created",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_since", mapOf(
+                        "afterIndex" to 1,
+                        "count" to 2,
+                        "fields" to listOf("requestLine")
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"index\":2"))
+                assertTrue(text.contains("\"index\":3"))
+                assertTrue(text.contains("GET /after-two HTTP/1.1"))
+                assertTrue(text.contains("GET /after-three HTTP/1.1"))
+            }
+        }
+
+        @Test
+        fun `get proxy http history body should return a bounded request slice`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /slice HTTP/1.1\r\nHost: example.com\r\n\r\nabcdef0123456789",
+                response = "HTTP/1.1 200 OK\r\n\r\nresponse-body",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_body", mapOf(
+                        "index" to 1,
+                        "message" to "request",
+                        "offset" to 4,
+                        "length" to 6
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("ef0123")
+            }
+        }
+
+        @Test
+        fun `create repeater tab from history should reuse selected request`() {
+            val proxy = mockk<Proxy>()
+            val repeater = mockk<burp.api.montoya.repeater.Repeater>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val request = mockk<HttpRequest>()
+
+            every { api.proxy() } returns proxy
+            every { api.repeater() } returns repeater
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.request() } returns request
+            every { repeater.sendToRepeater(any(), any()) } returns mockk(relaxed = true)
+
+            runBlocking {
+                val result = client.callTool(
+                    "create_repeater_tab_from_history", mapOf(
+                        "index" to 1,
+                        "tabName" to "latest-login"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Created Repeater tab from HTTP history index 1")
+            }
+
+            verify(exactly = 1) { repeater.sendToRepeater(request, "latest-login") }
+        }
+
+        @Test
+        fun `send to intruder from history should reuse selected request`() {
+            val proxy = mockk<Proxy>()
+            val intruder = mockk<burp.api.montoya.intruder.Intruder>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val request = mockk<HttpRequest>()
+
+            every { api.proxy() } returns proxy
+            every { api.intruder() } returns intruder
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.request() } returns request
+            every { intruder.sendToIntruder(any<HttpRequest>(), any<String>()) } just runs
+
+            runBlocking {
+                val result = client.callTool(
+                    "send_to_intruder_from_history", mapOf(
+                        "index" to 1,
+                        "tabName" to "latest-login"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Sent HTTP history index 1 to Intruder")
+            }
+
+            verify(exactly = 1) { intruder.sendToIntruder(request, "latest-login") }
+        }
     }
     
     @Nested
