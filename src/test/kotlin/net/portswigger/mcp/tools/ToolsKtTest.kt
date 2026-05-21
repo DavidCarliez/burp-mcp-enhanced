@@ -757,6 +757,110 @@ class ToolsKtTest {
                 assertEquals("Reached end of items", result3.expectTextContent())
             }
         }
+
+        @Test
+        fun `get latest proxy http history should return newest item without knowing offset`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>()
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /oldest HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /middle HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /newest HTTP/1.1\r\nHost: example.com\r\n\r\nbody",
+                response = "HTTP/1.1 201 Created",
+                notes = "new"
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_latest_proxy_http_history", mapOf(
+                        "count" to 1
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("POST /newest"), "Latest item should be returned")
+                assertTrue(text.contains("\"index\":3"), "Latest item should include 1-based history index")
+                assertFalse(text.contains("GET /middle"), "Older item should not be returned")
+                assertFalse(text.contains("GET /oldest"), "Oldest item should not be returned")
+            }
+        }
+
+        @Test
+        fun `get proxy http history count should return total count`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>()
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            runBlocking {
+                val result = client.callTool("get_proxy_http_history_count", emptyMap())
+                delay(100)
+                result.expectTextContent("3")
+            }
+        }
+
+        @Test
+        fun `get proxy http history by index should return the selected one based item`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>()
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /first HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /second HTTP/1.1",
+                response = "HTTP/1.1 404 Not Found",
+                notes = "selected"
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_by_index", mapOf(
+                        "index" to 2
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("GET /second"), "Requested item should be returned")
+                assertTrue(text.contains("\"index\":2"), "Response should include selected index")
+                assertFalse(text.contains("GET /first"), "Other items should not be returned")
+            }
+        }
     }
     
     @Nested
