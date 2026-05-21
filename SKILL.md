@@ -293,6 +293,82 @@ Example IDOR probe:
 
 The tool uses the original captured request as the base and sends it through Burp's HTTP stack. It returns the response in serialized form.
 
+### `send_http_request_from_history_with_diff`
+
+Replays a captured proxy HTTP request by 1-based index, applies the same optional path, body, and header mutations, and returns compact baseline vs mutated response evidence.
+
+Parameters:
+
+- `index`
+- `replacePath`
+- `replaceBody`
+- `replaceHeaders`
+- `bodyPreviewLength`
+
+Example:
+
+```json
+{
+  "index": 42,
+  "replacePath": "/api/users/124",
+  "replaceHeaders": {
+    "X-Burp-MCP-Probe": "idor-test"
+  },
+  "bodyPreviewLength": 1000
+}
+```
+
+Output includes:
+
+- `baseline.statusCode`, `baseline.contentType`, `baseline.bodyLength`, `baseline.bodySha256`, `baseline.headerNames`
+- `mutated.statusCode`, `mutated.contentType`, `mutated.bodyLength`, `mutated.bodySha256`, `mutated.headerNames`
+- `delta.statusChanged`, `delta.contentTypeChanged`, `delta.bodyLengthDelta`, `delta.bodyHashChanged`, `delta.similarity`
+- `delta.headerNamesAdded`, `delta.headerNamesRemoved`
+- `preview.firstDifference`
+
+Prefer this over raw replay when validating a hypothesis. It gives agents deterministic before/after evidence without dumping full bodies.
+
+### HTTP history annotations
+
+Use annotations to leave state for the human operator and later agents.
+
+Tools:
+
+- `set_proxy_http_history_note`
+- `append_proxy_http_history_note`
+- `set_proxy_http_history_highlight`
+
+Note example:
+
+```json
+{
+  "index": 42,
+  "note": "MCP candidate: possible IDOR. Mutated /api/users/124 returned 200 with similar JSON shape."
+}
+```
+
+Highlight example:
+
+```json
+{
+  "index": 42,
+  "highlight": "red"
+}
+```
+
+Valid highlight values: `none`, `red`, `orange`, `yellow`, `green`, `cyan`, `blue`, `pink`, `magenta`, `gray`.
+
+Suggested color convention:
+
+- `red`: high-value or likely vulnerability
+- `orange`: needs manual review
+- `yellow`: suspicious but weak
+- `green`: tested and likely safe
+- `cyan`: auth/session behavior
+- `blue`: recon or coverage marker
+- `pink` or `magenta`: parser, weirdness, or error behavior
+- `gray`: deprioritized
+
 ### Repeater and Intruder from history
 
 Use these when a candidate needs manual or attack-tool follow-up:
@@ -367,7 +443,7 @@ The final JAR should contain both the extension classes and the embedded proxy J
 git status --short
 ./gradlew test
 ./gradlew embedProxyJar
-git add src/main/kotlin/net/portswigger/mcp/tools/Tools.kt src/test/kotlin/net/portswigger/mcp/tools/ToolsKtTest.kt SKILL.md
+git add src/main/kotlin/net/portswigger/mcp/tools/Tools.kt src/test/kotlin/net/portswigger/mcp/tools/ToolsKtTest.kt AGENTS.md SKILL.md
 git commit -m "feat: describe burp mcp enhanced workflow"
 git push origin main
 ```
@@ -410,9 +486,9 @@ Security gates matter:
 
 1. Find authenticated request by method, path, host, and status.
 2. Slice request headers to confirm auth context and content type.
-3. Replay from history with `replacePath` or `replaceBody`.
-4. Compare status code, body length, and response content.
-5. If promising, create a Repeater tab from history and name it after the primitive.
+3. Replay from history with `send_http_request_from_history_with_diff` using a controlled `replacePath`, `replaceBody`, or `replaceHeaders` mutation.
+4. Compare status, body length delta, body hash change, similarity, and first-difference preview.
+5. If promising, append a note, set a highlight, create a Repeater tab from history, and name it after the primitive.
 
 ### Validate input handling candidates
 

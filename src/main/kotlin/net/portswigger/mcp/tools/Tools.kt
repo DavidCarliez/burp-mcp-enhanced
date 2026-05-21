@@ -5,6 +5,7 @@ import burp.api.montoya.burpsuite.TaskExecutionEngine.TaskExecutionEngineState.P
 import burp.api.montoya.burpsuite.TaskExecutionEngine.TaskExecutionEngineState.RUNNING
 import burp.api.montoya.collaborator.InteractionFilter
 import burp.api.montoya.core.BurpSuiteEdition
+import burp.api.montoya.core.HighlightColor
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
@@ -20,6 +21,7 @@ import net.portswigger.mcp.security.HistoryAccessSecurity
 import net.portswigger.mcp.security.HistoryAccessType
 import net.portswigger.mcp.security.HttpRequestSecurity
 import java.awt.KeyboardFocusManager
+import java.security.MessageDigest
 import java.util.regex.Pattern
 import javax.swing.JTextArea
 
@@ -161,6 +163,114 @@ private fun historyItemMatches(
         (hasRequestBodyFilter == null || requestBody.isNotEmpty() == hasRequestBodyFilter) &&
         (hasResponseBodyFilter == null || responseBody.isNotEmpty() == hasResponseBodyFilter) &&
         (contentTypeContains == null || contentType(serializableItem.request, serializableItem.response)?.contains(contentTypeContains, ignoreCase = true) == true)
+}
+
+private fun applyHistoryRequestMutation(
+    originalRequest: HttpRequest,
+    replacePath: String?,
+    replaceBody: String?,
+    replaceHeaders: Map<String, String>?,
+): HttpRequest {
+    var request = originalRequest
+    if (replacePath != null) request = request.withPath(replacePath)
+    if (replaceBody != null) request = request.withBody(replaceBody)
+    replaceHeaders?.forEach { (name, value) ->
+        request = request.withUpdatedHeader(name, value)
+    }
+    return request
+}
+
+private fun sha256Hex(value: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it) }
+}
+
+private fun headerNames(message: String?): Set<String> {
+    return headerPart(message).lineSequence()
+        .drop(1)
+        .mapNotNull { line ->
+            val separator = line.indexOf(':')
+            if (separator < 0) null else line.substring(0, separator).trim()
+        }
+        .filter { it.isNotBlank() }
+        .toSet()
+}
+
+private fun responseFingerprint(message: String?): JsonObject {
+    val body = bodyPart(message)
+    return buildJsonObject {
+        put("statusCode", statusCode(message)?.let { JsonPrimitive(it) } ?: JsonNull)
+        put("contentType", headerValue(message, "Content-Type")?.let { JsonPrimitive(it) } ?: JsonNull)
+        put("bodyLength", body.length)
+        put("bodySha256", sha256Hex(body))
+        putJsonArray("headerNames") {
+            headerNames(message).sorted().forEach { add(it) }
+        }
+    }
+}
+
+private fun responseSimilarity(left: String, right: String): Double {
+    if (left == right) return 1.0
+    val maxLength = maxOf(left.length, right.length)
+    if (maxLength == 0) return 1.0
+    val commonPrefix = left.zip(right).takeWhile { it.first == it.second }.count()
+    return commonPrefix.toDouble() / maxLength.toDouble()
+}
+
+private fun firstDifferencePreview(left: String, right: String, previewLength: Int): JsonObject {
+    val safeLength = previewLength.coerceAtLeast(0)
+    val diffIndex = left.zip(right).indexOfFirst { it.first != it.second }.let { index ->
+        when {
+            index >= 0 -> index
+            left.length != right.length -> minOf(left.length, right.length)
+            else -> -1
+        }
+    }
+    return buildJsonObject {
+        if (diffIndex < 0 || safeLength == 0) {
+            put("offset", if (diffIndex < 0) JsonNull else JsonPrimitive(diffIndex))
+            put("baseline", "")
+            put("mutated", "")
+        } else {
+            val start = (diffIndex - safeLength / 4).coerceAtLeast(0)
+            put("offset", diffIndex)
+            put("baseline", sliceBody(left, start, safeLength))
+            put("mutated", sliceBody(right, start, safeLength))
+        }
+    }
+}
+
+private fun responseDiffJson(baselineResponse: String?, mutatedResponse: String?, bodyPreviewLength: Int): String {
+    val baseline = baselineResponse ?: ""
+    val mutated = mutatedResponse ?: ""
+    val baselineBody = bodyPart(baseline)
+    val mutatedBody = bodyPart(mutated)
+    val baselineHeaders = headerNames(baseline)
+    val mutatedHeaders = headerNames(mutated)
+    return Json.encodeToString(buildJsonObject {
+        put("baseline", responseFingerprint(baseline))
+        put("mutated", responseFingerprint(mutated))
+        putJsonObject("delta") {
+            put("statusChanged", statusCode(baseline) != statusCode(mutated))
+            put("contentTypeChanged", headerValue(baseline, "Content-Type") != headerValue(mutated, "Content-Type"))
+            put("bodyLengthDelta", mutatedBody.length - baselineBody.length)
+            put("bodyHashChanged", sha256Hex(baselineBody) != sha256Hex(mutatedBody))
+            put("similarity", responseSimilarity(baselineBody, mutatedBody))
+            putJsonArray("headerNamesAdded") {
+                (mutatedHeaders - baselineHeaders).sorted().forEach { add(it) }
+            }
+            putJsonArray("headerNamesRemoved") {
+                (baselineHeaders - mutatedHeaders).sorted().forEach { add(it) }
+            }
+        }
+        putJsonObject("preview") {
+            put("firstDifference", firstDifferencePreview(baselineBody, mutatedBody, bodyPreviewLength))
+        }
+    })
+}
+
+private fun parseHighlightColor(highlight: String): HighlightColor? {
+    return runCatching { HighlightColor.valueOf(highlight.trim().uppercase()) }.getOrNull()
 }
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
@@ -523,13 +633,71 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         val originalRequest = api.proxy().history().getOrNull(index - 1)?.request()
             ?: return@mcpTool "No HTTP request found at history index $index"
-        var request = originalRequest
-        if (replacePath != null) request = request.withPath(replacePath)
-        if (replaceBody != null) request = request.withBody(replaceBody)
-        replaceHeaders?.forEach { (name, value) ->
-            request = request.withUpdatedHeader(name, value)
-        }
+        val request = applyHistoryRequestMutation(originalRequest, replacePath, replaceBody, replaceHeaders)
         api.http().sendRequest(request)?.toString() ?: "<no response>"
+    }
+
+    mcpTool<SendHttpRequestFromHistoryWithDiff>("Replays a proxy HTTP history request by 1-based index and returns compact baseline vs mutated response fingerprints, deltas, and first-difference preview") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "replay HTTP history with diff")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val historyItem = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP request found at history index $index"
+        val baselineResponse = historyItem.toSerializableForm().response
+        val request = applyHistoryRequestMutation(historyItem.request(), replacePath, replaceBody, replaceHeaders)
+        val mutatedResponse = api.http().sendRequest(request)?.toString()
+            ?: return@mcpTool "<no response>"
+        responseDiffJson(baselineResponse, mutatedResponse, bodyPreviewLength)
+    }
+
+    mcpTool<SetProxyHttpHistoryNote>("Sets the note for a proxy HTTP history item by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "set HTTP history note")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val historyItem = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP history found at $index"
+        historyItem.annotations().setNotes(note)
+        "Set note on HTTP history index $index"
+    }
+
+    mcpTool<AppendProxyHttpHistoryNote>("Appends a line to the note for a proxy HTTP history item by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "append HTTP history note")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val historyItem = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP history found at $index"
+        val annotations = historyItem.annotations()
+        val existing = annotations.notes().takeUnless { it.isNullOrBlank() }
+        annotations.setNotes(listOfNotNull(existing, note).joinToString("\n"))
+        "Appended note on HTTP history index $index"
+    }
+
+    mcpTool<SetProxyHttpHistoryHighlight>("Sets the highlight color for a proxy HTTP history item by 1-based index. Valid colors: none, red, orange, yellow, green, cyan, blue, pink, magenta, gray") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "set HTTP history highlight")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val color = parseHighlightColor(highlight)
+            ?: return@mcpTool "highlight must be one of: none, red, orange, yellow, green, cyan, blue, pink, magenta, gray"
+        val historyItem = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP history found at $index"
+        historyItem.annotations().setHighlightColor(color)
+        "Set highlight ${highlight.lowercase()} on HTTP history index $index"
     }
 
     mcpTool<CreateRepeaterTabFromHistory>("Creates a Repeater tab from a proxy HTTP history item by 1-based index") {
@@ -793,6 +961,24 @@ data class SendHttpRequestFromHistory(
     val replaceBody: String? = null,
     val replaceHeaders: Map<String, String>? = null,
 )
+
+@Serializable
+data class SendHttpRequestFromHistoryWithDiff(
+    val index: Int,
+    val replacePath: String? = null,
+    val replaceBody: String? = null,
+    val replaceHeaders: Map<String, String>? = null,
+    val bodyPreviewLength: Int = 1000,
+)
+
+@Serializable
+data class SetProxyHttpHistoryNote(val index: Int, val note: String)
+
+@Serializable
+data class AppendProxyHttpHistoryNote(val index: Int, val note: String)
+
+@Serializable
+data class SetProxyHttpHistoryHighlight(val index: Int, val highlight: String)
 
 @Serializable
 data class CreateRepeaterTabFromHistory(val index: Int, val tabName: String? = null)

@@ -172,7 +172,77 @@ Replay rules:
 - Compare status code, response length, content type, and semantic body differences.
 - Preserve authentication unless the test specifically targets auth behavior.
 - Do not fuzz aggressively through this tool. It sends live HTTP traffic.
-- For promising candidates, create a Repeater tab.
+- Prefer `send_http_request_from_history_with_diff` when validating a hypothesis because it returns compact before/after evidence.
+- For promising candidates, annotate the Burp row and create a Repeater tab.
+
+## Replay With Diff
+
+Use `send_http_request_from_history_with_diff` when testing a candidate. It replays a captured request with optional mutation, then returns baseline and mutated response fingerprints plus deltas.
+
+```json
+{
+  "index": 42,
+  "replacePath": "/api/users/124",
+  "replaceHeaders": {
+    "X-Burp-MCP-Probe": "idor-test"
+  },
+  "bodyPreviewLength": 1000
+}
+```
+
+Look at:
+
+- `statusChanged`
+- `contentTypeChanged`
+- `bodyLengthDelta`
+- `bodyHashChanged`
+- `similarity`
+- `headerNamesAdded`
+- `headerNamesRemoved`
+- `preview.firstDifference`
+
+A useful result is not just a changed hash. Prefer candidates with stable success status, similar structure, and meaningful semantic body differences.
+
+## Annotating Burp History
+
+Use annotations so the human and the next agent can resume from Burp itself.
+
+Set or append a note:
+
+```json
+{
+  "index": 42,
+  "note": "MCP candidate: possible IDOR. /api/users/124 returned 200 with similar JSON shape."
+}
+```
+
+Tools:
+
+- `set_proxy_http_history_note`
+- `append_proxy_http_history_note`
+
+Set a highlight:
+
+```json
+{
+  "index": 42,
+  "highlight": "red"
+}
+```
+
+Tool: `set_proxy_http_history_highlight`
+
+Color convention:
+
+- `red`: high-value or likely vulnerability
+- `orange`: needs manual review
+- `yellow`: suspicious but weak
+- `green`: tested and likely safe
+- `cyan`: auth/session behavior
+- `blue`: recon or coverage marker
+- `pink` or `magenta`: parser, weirdness, or error behavior
+- `gray`: deprioritized
+- `none`: clear highlight
 
 ## Repeater and Intruder Handoff
 
@@ -215,9 +285,9 @@ Tool: `send_to_intruder_from_history`
 ```
 
 2. Pull request headers for auth context.
-3. Replay with a neighboring object ID in `replacePath`.
-4. Compare response status and body semantics.
-5. Send confirmed candidate to Repeater.
+3. Replay with a neighboring object ID using `send_http_request_from_history_with_diff`.
+4. Review status, body length delta, hash change, similarity, and first difference.
+5. If promising, append a note, set a highlight, and send confirmed candidate to Repeater.
 
 ### JSON Input Handling
 

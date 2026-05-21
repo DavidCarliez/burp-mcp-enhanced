@@ -3,8 +3,10 @@ package net.portswigger.mcp.tools
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.burpsuite.TaskExecutionEngine
 import burp.api.montoya.collaborator.*
+import burp.api.montoya.core.Annotations
 import burp.api.montoya.core.BurpSuiteEdition
 import burp.api.montoya.core.ByteArray
+import burp.api.montoya.core.HighlightColor
 import burp.api.montoya.http.Http
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpProtocol
@@ -1186,6 +1188,136 @@ class ToolsKtTest {
             }
 
             verify(exactly = 1) { http.sendRequest(headerMutatedRequest) }
+        }
+
+        @Test
+        fun `send http request from history with diff should return baseline mutated fingerprints and delta`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val originalRequest = mockk<HttpRequest>()
+            val mutatedRequest = mockk<HttpRequest>()
+            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.request() } returns originalRequest
+            every { originalRequest.toString() } returns "GET /api/users/123 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            every { originalRequest.withPath("/api/users/124") } returns mutatedRequest
+            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-New: yes\r\n\r\n{\"id\":124,\"name\":\"alice-updated\"}"
+            every { http.sendRequest(mutatedRequest) } returns httpResponse
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { historyItem.toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /api/users/123 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":123,\"name\":\"alice\"}",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "send_http_request_from_history_with_diff", mapOf(
+                        "index" to 1,
+                        "replacePath" to "/api/users/124",
+                        "bodyPreviewLength" to 200
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"baseline\""))
+                assertTrue(text.contains("\"mutated\""))
+                assertTrue(text.contains("\"delta\""))
+                assertTrue(text.contains("\"statusCode\":200"))
+                assertTrue(text.contains("\"bodyHashChanged\":true"))
+                assertTrue(text.contains("\"bodyLengthDelta\":8"))
+                assertTrue(text.contains("\"headerNamesAdded\":[\"X-New\"]"))
+                assertTrue(text.contains("\"firstDifference\""))
+                assertTrue(text.contains("123"))
+                assertTrue(text.contains("124"))
+            }
+
+            verify(exactly = 1) { http.sendRequest(mutatedRequest) }
+        }
+
+        @Test
+        fun `set proxy http history note should update annotations`() {
+            val proxy = mockk<Proxy>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val annotations = mockk<Annotations>()
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.annotations() } returns annotations
+            every { annotations.setNotes(any()) } just runs
+
+            runBlocking {
+                val result = client.callTool(
+                    "set_proxy_http_history_note", mapOf(
+                        "index" to 1,
+                        "note" to "MCP candidate: possible IDOR"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Set note on HTTP history index 1")
+            }
+
+            verify(exactly = 1) { annotations.setNotes("MCP candidate: possible IDOR") }
+        }
+
+        @Test
+        fun `append proxy http history note should preserve existing notes`() {
+            val proxy = mockk<Proxy>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val annotations = mockk<Annotations>()
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.annotations() } returns annotations
+            every { annotations.notes() } returns "Existing note"
+            every { annotations.setNotes(any()) } just runs
+
+            runBlocking {
+                val result = client.callTool(
+                    "append_proxy_http_history_note", mapOf(
+                        "index" to 1,
+                        "note" to "MCP delta: 200 with similar JSON"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Appended note on HTTP history index 1")
+            }
+
+            verify(exactly = 1) { annotations.setNotes("Existing note\nMCP delta: 200 with similar JSON") }
+        }
+
+        @Test
+        fun `set proxy http history highlight should update highlight color`() {
+            val proxy = mockk<Proxy>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val annotations = mockk<Annotations>()
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.annotations() } returns annotations
+            every { annotations.setHighlightColor(any()) } just runs
+
+            runBlocking {
+                val result = client.callTool(
+                    "set_proxy_http_history_highlight", mapOf(
+                        "index" to 1,
+                        "highlight" to "red"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Set highlight red on HTTP history index 1")
+            }
+
+            verify(exactly = 1) { annotations.setHighlightColor(HighlightColor.RED) }
         }
     }
     
