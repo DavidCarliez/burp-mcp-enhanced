@@ -47,6 +47,17 @@ private fun firstLine(message: String?): String? {
     return message?.lineSequence()?.firstOrNull()
 }
 
+private fun headerPart(message: String?): String {
+    if (message == null) return ""
+    val crlfBodyIndex = message.indexOf("\r\n\r\n")
+    if (crlfBodyIndex >= 0) return message.substring(0, crlfBodyIndex)
+
+    val lfBodyIndex = message.indexOf("\n\n")
+    if (lfBodyIndex >= 0) return message.substring(0, lfBodyIndex)
+
+    return message
+}
+
 private fun bodyPart(message: String?): String {
     if (message == null) return ""
     val crlfBodyIndex = message.indexOf("\r\n\r\n")
@@ -55,8 +66,28 @@ private fun bodyPart(message: String?): String {
     val lfBodyIndex = message.indexOf("\n\n")
     if (lfBodyIndex >= 0) return message.substring(lfBodyIndex + 2)
 
-    return message
+    return ""
 }
+
+private fun headerValue(message: String?, name: String): String? {
+    return headerPart(message).lineSequence()
+        .drop(1)
+        .mapNotNull { line ->
+            val separator = line.indexOf(':')
+            if (separator < 0) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+        }
+        .firstOrNull { it.first.equals(name, ignoreCase = true) }
+        ?.second
+}
+
+private fun requestMethod(request: String?): String? = firstLine(request)?.split(" ")?.getOrNull(0)
+
+private fun requestPath(request: String?): String? = firstLine(request)?.split(" ")?.getOrNull(1)
+
+private fun statusCode(response: String?): Int? = firstLine(response)?.split(" ")?.getOrNull(1)?.toIntOrNull()
+
+private fun contentType(request: String?, response: String?): String? =
+    headerValue(response, "Content-Type") ?: headerValue(request, "Content-Type")
 
 private fun serializeHttpHistoryItem(
     index: Int,
@@ -69,11 +100,22 @@ private fun serializeHttpHistoryItem(
         Json.encodeToJsonElement(serializableItem)
     } else {
         buildJsonObject {
+            val requestBody = bodyPart(serializableItem.request)
+            val responseBody = bodyPart(serializableItem.response)
             if ("request" in selectedFields) put("request", serializableItem.request?.let { JsonPrimitive(it) } ?: JsonNull)
             if ("response" in selectedFields) put("response", serializableItem.response?.let { JsonPrimitive(it) } ?: JsonNull)
             if ("notes" in selectedFields) put("notes", serializableItem.notes?.let { JsonPrimitive(it) } ?: JsonNull)
             if ("requestLine" in selectedFields) put("requestLine", firstLine(serializableItem.request)?.let { JsonPrimitive(it) } ?: JsonNull)
             if ("responseLine" in selectedFields) put("responseLine", firstLine(serializableItem.response)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("method" in selectedFields) put("method", requestMethod(serializableItem.request)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("path" in selectedFields) put("path", requestPath(serializableItem.request)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("host" in selectedFields) put("host", headerValue(serializableItem.request, "Host")?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("statusCode" in selectedFields) put("statusCode", statusCode(serializableItem.response)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("contentType" in selectedFields) put("contentType", contentType(serializableItem.request, serializableItem.response)?.let { JsonPrimitive(it) } ?: JsonNull)
+            if ("requestContentLength" in selectedFields) put("requestContentLength", requestBody.length)
+            if ("responseContentLength" in selectedFields) put("responseContentLength", responseBody.length)
+            if ("hasRequestBody" in selectedFields) put("hasRequestBody", requestBody.isNotEmpty())
+            if ("hasResponseBody" in selectedFields) put("hasResponseBody", responseBody.isNotEmpty())
         }
     }
     return truncateIfNeeded(Json.encodeToString(buildJsonObject {
@@ -87,6 +129,38 @@ private fun sliceBody(message: String, offset: Int, length: Int): String {
     val safeLength = length.coerceAtLeast(0)
     if (safeOffset >= message.length || safeLength == 0) return ""
     return message.substring(safeOffset, (safeOffset + safeLength).coerceAtMost(message.length))
+}
+
+private fun sliceMessage(message: String, part: String, offset: Int, length: Int): String {
+    val selected = when (part.lowercase()) {
+        "headers" -> headerPart(message)
+        "body" -> bodyPart(message)
+        "full" -> message
+        else -> return "part must be 'headers', 'body', or 'full'"
+    }
+    return sliceBody(selected, offset, length)
+}
+
+private fun historyItemMatches(
+    item: ProxyHttpRequestResponse,
+    method: String?,
+    host: String?,
+    pathContains: String?,
+    statusCodeFilter: Int?,
+    hasRequestBodyFilter: Boolean?,
+    hasResponseBodyFilter: Boolean?,
+    contentTypeContains: String?,
+): Boolean {
+    val serializableItem = item.toSerializableForm()
+    val requestBody = bodyPart(serializableItem.request)
+    val responseBody = bodyPart(serializableItem.response)
+    return (method == null || requestMethod(serializableItem.request)?.equals(method, ignoreCase = true) == true) &&
+        (host == null || headerValue(serializableItem.request, "Host")?.equals(host, ignoreCase = true) == true) &&
+        (pathContains == null || requestPath(serializableItem.request)?.contains(pathContains, ignoreCase = true) == true) &&
+        (statusCodeFilter == null || statusCode(serializableItem.response) == statusCodeFilter) &&
+        (hasRequestBodyFilter == null || requestBody.isNotEmpty() == hasRequestBodyFilter) &&
+        (hasResponseBodyFilter == null || responseBody.isNotEmpty() == hasResponseBodyFilter) &&
+        (contentTypeContains == null || contentType(serializableItem.request, serializableItem.response)?.contains(contentTypeContains, ignoreCase = true) == true)
 }
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
@@ -400,6 +474,64 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         sliceBody(bodyPart(selectedMessage), offset, length)
     }
 
+    mcpTool<GetProxyHttpHistoryMessageSlice>("Returns a bounded headers, body, or full-message slice from a proxy HTTP history request or response by 1-based index") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP history message slice")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val requestResponse = api.proxy().history().getOrNull(index - 1)
+            ?: return@mcpTool "No HTTP history found at $index"
+        val serializableItem = requestResponse.toSerializableForm()
+        val selectedMessage = when (message.lowercase()) {
+            "request" -> serializableItem.request
+            "response" -> serializableItem.response
+            else -> return@mcpTool "message must be 'request' or 'response'"
+        } ?: ""
+        sliceMessage(selectedMessage, part, offset, length)
+    }
+
+    mcpTool<GetProxyHttpHistoryFiltered>("Displays proxy HTTP history items filtered by structured request and response metadata") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "filtered HTTP history")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val history = api.proxy().history()
+        val indexedHistory = history.mapIndexed { pageIndex, item -> pageIndex + 1 to item }
+        val ordered = if (newestFirst) indexedHistory.asReversed() else indexedHistory
+        val matches = ordered.asSequence()
+            .filter { (_, item) -> historyItemMatches(item, method, host, pathContains, statusCode, hasRequestBody, hasResponseBody, contentTypeContains) }
+            .take(count)
+            .map { (historyIndex, item) -> serializeHttpHistoryItem(historyIndex, item, fields) }
+            .toList()
+
+        if (matches.isEmpty()) "Reached end of items" else matches.joinToString(separator = "\n\n")
+    }
+
+    mcpTool<SendHttpRequestFromHistory>("Replays a proxy HTTP history request by 1-based index with optional path, body, and header mutations") {
+        val allowed = runBlocking {
+            checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "replay HTTP history")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val originalRequest = api.proxy().history().getOrNull(index - 1)?.request()
+            ?: return@mcpTool "No HTTP request found at history index $index"
+        var request = originalRequest
+        if (replacePath != null) request = request.withPath(replacePath)
+        if (replaceBody != null) request = request.withBody(replaceBody)
+        replaceHeaders?.forEach { (name, value) ->
+            request = request.withUpdatedHeader(name, value)
+        }
+        api.http().sendRequest(request)?.toString() ?: "<no response>"
+    }
+
     mcpTool<CreateRepeaterTabFromHistory>("Creates a Repeater tab from a proxy HTTP history item by 1-based index") {
         val allowed = runBlocking {
             checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "create Repeater tab from HTTP history")
@@ -630,6 +762,37 @@ data class GetProxyHttpHistorySince(val afterIndex: Int, val count: Int = 10, va
 
 @Serializable
 data class GetProxyHttpHistoryBody(val index: Int, val message: String, val offset: Int = 0, val length: Int = 5000)
+
+@Serializable
+data class GetProxyHttpHistoryMessageSlice(
+    val index: Int,
+    val message: String,
+    val part: String = "body",
+    val offset: Int = 0,
+    val length: Int = 5000,
+)
+
+@Serializable
+data class GetProxyHttpHistoryFiltered(
+    val method: String? = null,
+    val host: String? = null,
+    val pathContains: String? = null,
+    val statusCode: Int? = null,
+    val hasRequestBody: Boolean? = null,
+    val hasResponseBody: Boolean? = null,
+    val contentTypeContains: String? = null,
+    val newestFirst: Boolean = false,
+    val count: Int = 10,
+    val fields: List<String>? = null,
+)
+
+@Serializable
+data class SendHttpRequestFromHistory(
+    val index: Int,
+    val replacePath: String? = null,
+    val replaceBody: String? = null,
+    val replaceHeaders: Map<String, String>? = null,
+)
 
 @Serializable
 data class CreateRepeaterTabFromHistory(val index: Int, val tabName: String? = null)

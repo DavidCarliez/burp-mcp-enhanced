@@ -1022,6 +1022,171 @@ class ToolsKtTest {
 
             verify(exactly = 1) { intruder.sendToIntruder(request, "latest-login") }
         }
+
+        @Test
+        fun `get latest proxy http history should expose computed metadata fields`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /api/users?id=1 HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\n\r\n{\"name\":\"david\"}",
+                response = "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_latest_proxy_http_history", mapOf(
+                        "count" to 1,
+                        "fields" to listOf("method", "path", "host", "statusCode", "contentType", "requestContentLength", "responseContentLength", "hasRequestBody", "hasResponseBody")
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"method\":\"POST\""))
+                assertTrue(text.contains("\"path\":\"/api/users?id=1\""))
+                assertTrue(text.contains("\"host\":\"api.example.com\""))
+                assertTrue(text.contains("\"statusCode\":201"))
+                assertTrue(text.contains("\"contentType\":\"application/json\""))
+                assertTrue(text.contains("\"requestContentLength\":16"))
+                assertTrue(text.contains("\"responseContentLength\":11"))
+                assertTrue(text.contains("\"hasRequestBody\":true"))
+                assertTrue(text.contains("\"hasResponseBody\":true"))
+                assertFalse(text.contains("david"), "Full body should not be included for metadata-only fields")
+            }
+        }
+
+        @Test
+        fun `get proxy http history filtered should filter by method path status and content type`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>(),
+                mockk<ProxyHttpRequestResponse>()
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /api/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
+                notes = null
+            )
+            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\n\r\n{\"name\":\"david\"}",
+                response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":true}",
+                notes = "candidate"
+            )
+            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /static/upload HTTP/1.1\r\nHost: cdn.example.com\r\nContent-Type: multipart/form-data\r\n\r\nfile=data",
+                response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nok",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_filtered", mapOf(
+                        "method" to "POST",
+                        "host" to "api.example.com",
+                        "pathContains" to "/api/",
+                        "statusCode" to 500,
+                        "hasRequestBody" to true,
+                        "contentTypeContains" to "json",
+                        "count" to 10,
+                        "fields" to listOf("method", "path", "host", "statusCode", "notes")
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"index\":2"))
+                assertTrue(text.contains("\"method\":\"POST\""))
+                assertTrue(text.contains("\"path\":\"/api/users\""))
+                assertTrue(text.contains("candidate"))
+                assertFalse(text.contains("\"index\":1"))
+                assertFalse(text.contains("\"index\":3"))
+            }
+        }
+
+        @Test
+        fun `get proxy http history message slice should return headers slice`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
+                request = "POST /slice HTTP/1.1\r\nHost: example.com\r\nX-Test: abc\r\n\r\nrequest-body",
+                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nresponse-body",
+                notes = null
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_message_slice", mapOf(
+                        "index" to 1,
+                        "message" to "request",
+                        "part" to "headers",
+                        "offset" to 0,
+                        "length" to 200
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("Host: example.com"))
+                assertTrue(text.contains("X-Test: abc"))
+                assertFalse(text.contains("request-body"))
+            }
+        }
+
+        @Test
+        fun `send http request from history should replay mutated request`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val historyItem = mockk<ProxyHttpRequestResponse>()
+            val originalRequest = mockk<HttpRequest>()
+            val pathMutatedRequest = mockk<HttpRequest>()
+            val bodyMutatedRequest = mockk<HttpRequest>()
+            val headerMutatedRequest = mockk<HttpRequest>()
+            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(historyItem)
+            every { historyItem.request() } returns originalRequest
+            every { originalRequest.toString() } returns "POST /old HTTP/1.1\r\nHost: example.com\r\n\r\nold=1"
+            every { originalRequest.withPath("/new") } returns pathMutatedRequest
+            every { pathMutatedRequest.withBody("new=2") } returns bodyMutatedRequest
+            every { bodyMutatedRequest.withUpdatedHeader("X-Test", "yes") } returns headerMutatedRequest
+            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\n\r\nreplayed"
+            every { http.sendRequest(headerMutatedRequest) } returns httpResponse
+
+            runBlocking {
+                val result = client.callTool(
+                    "send_http_request_from_history", mapOf(
+                        "index" to 1,
+                        "replacePath" to "/new",
+                        "replaceBody" to "new=2",
+                        "replaceHeaders" to mapOf("X-Test" to "yes")
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("HTTP/1.1 200 OK\r\n\r\nreplayed")
+            }
+
+            verify(exactly = 1) { http.sendRequest(headerMutatedRequest) }
+        }
     }
     
     @Nested
