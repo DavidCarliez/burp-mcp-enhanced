@@ -46,11 +46,19 @@ dependencies {
     implementation(libs.bundles.ktor.server)
     implementation(libs.kotlin.stdlib)
     implementation(libs.kotlinx.serialization.json)
-    implementation(libs.mcp.kotlin.sdk)
+    implementation(libs.mcp.kotlin.sdk) {
+        exclude(group = "net.portswigger.burp.extensions")
+    }
 
     testImplementation(libs.bundles.test.framework)
     testImplementation(libs.bundles.ktor.test)
     testImplementation(libs.burp.montoya.api)
+}
+
+configurations.configureEach {
+    if (name.endsWith("RuntimeClasspath", ignoreCase = true) || name == "runtimeElements") {
+        exclude(group = "net.portswigger.burp.extensions")
+    }
 }
 
 java {
@@ -102,6 +110,7 @@ tasks {
         manifest {
             attributes(
                 mapOf(
+                    "BurpExtension-Class" to "net.portswigger.mcp.ExtensionBase",
                     "Implementation-Title" to project.name,
                     "Implementation-Version" to project.version,
                     "Implementation-Vendor" to "PortSwigger",
