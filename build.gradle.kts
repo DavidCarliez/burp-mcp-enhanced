@@ -55,8 +55,12 @@ dependencies {
     testImplementation(libs.burp.montoya.api)
 }
 
+// Burp provides the Montoya API at runtime, so it must never be bundled into the extension jar.
+// The test runtime classpath is exempt: the unit tests exercise the API types directly.
 configurations.configureEach {
-    if (name.endsWith("RuntimeClasspath", ignoreCase = true) || name == "runtimeElements") {
+    if ((name.endsWith("RuntimeClasspath", ignoreCase = true) || name == "runtimeElements") &&
+        name != "testRuntimeClasspath"
+    ) {
         exclude(group = "net.portswigger.burp.extensions")
     }
 }
