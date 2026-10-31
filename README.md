@@ -12,6 +12,19 @@ For more information about the protocol visit: [modelcontextprotocol.io](https:/
 - Automatic installation for Claude Desktop
 - Comes with packaged Stdio MCP proxy server
 
+## Fork additions
+
+This fork is built on upstream 1.3.0 and adds agent-oriented proxy history tooling:
+
+- Global 1-based indexes. Paginated lists, regex search, structured filtering, `_by_index`, body and message slices, replay, notes, highlights, Repeater and Intruder all address the same row, and every item carries Burp's `id` next to its `index`.
+- Metadata-only filtering (`get_proxy_http_history_filtered`) with `offset` paging, plus `totalMatches`/`hasMore` in the response. Hosts match with or without the port.
+- Bounded output everywhere: `count` <= 500, slices <= 200000 characters, one history item <= 5000 characters of valid JSON, send/replay responses <= 200000 characters.
+- Replay with mutations and a response diff (`send_http_request_from_history`, `..._with_diff`). Replayed traffic passes the same per-target approval gate as `send_http1_request`, and `replaceHeaders` adds headers that are missing instead of dropping them.
+- History annotations, Repeater/Intruder handoff and a WebSocket frame count, all behind the existing history approval gate.
+- Upstream hardening kept intact: JSON-preserving truncation, prelude-only request normalization, credential redaction in exported config (toggle in the MCP tab), cancellable approvals, HTTP/2 Repeater tabs and Organizer tools.
+
+Agent-facing contracts and worked examples live in `SKILL.md` and `AGENTS.md`.
+
 ## Usage
 
 - Install the extension in Burp Suite
