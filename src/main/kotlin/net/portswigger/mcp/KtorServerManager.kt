@@ -34,7 +34,7 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
                 server = null
 
                 val mcpServer = Server(
-                    serverInfo = Implementation("burp-suite", "1.1.2"), options = ServerOptions(
+                    serverInfo = Implementation("burp-suite", extensionVersion()), options = ServerOptions(
                         capabilities = ServerCapabilities(
                             tools = ServerCapabilities.Tools(listChanged = false)
                         )
@@ -178,6 +178,24 @@ class KtorServerManager(private val api: MontoyaApi) : ServerManager {
         } catch (_: Exception) {
             return false
         }
+    }
+
+    /**
+     * Version reported to MCP clients in `serverInfo`. Read from the extension JAR manifest so it
+     * always matches the build that Burp actually loaded; `dev` means the extension is running from
+     * a class directory without manifest attributes (IDE/tests).
+     */
+    private fun extensionVersion(): String {
+        KtorServerManager::class.java.`package`?.implementationVersion?.takeIf { it.isNotBlank() }?.let { return it }
+
+        return runCatching {
+            KtorServerManager::class.java.classLoader
+                ?.getResourceAsStream("META-INF/MANIFEST.MF")
+                ?.use { stream ->
+                    java.util.jar.Manifest(stream).mainAttributes.getValue("Implementation-Version")
+                }
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: "dev"
     }
 
     private fun isValidReferer(referer: String): Boolean {
