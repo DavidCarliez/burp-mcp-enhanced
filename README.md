@@ -18,6 +18,8 @@ This fork is built on upstream 1.3.0 and adds agent-oriented proxy history tooli
 
 - Global 1-based indexes. Paginated lists, regex search, structured filtering, `_by_index`, body and message slices, replay, notes, highlights, Repeater and Intruder all address the same row, and every item carries Burp's `id` next to its `index`.
 - Metadata-only filtering (`get_proxy_http_history_filtered`) with `offset` paging, plus `totalMatches`/`hasMore` in the response. Hosts match with or without the port.
+- `search_proxy_http_history` finds a regex hit inside the history and returns it with its offset and
+  surrounding text in one call, instead of paging through 5000-character item dumps and body slices.
 - Bounded output everywhere: `count` <= 500, slices <= 200000 characters, one history item <= 5000 characters of valid JSON, send/replay responses <= 200000 characters.
 - Replay with mutations and a response diff (`send_http_request_from_history`, `..._with_diff`). Replayed traffic passes the same per-target approval gate as `send_http1_request`, and `replaceHeaders` adds headers that are missing instead of dropping them.
 - History annotations, Repeater/Intruder handoff and a WebSocket frame count, all behind the existing history approval gate.

@@ -181,6 +181,27 @@ Use before pagination or when checking if new traffic arrived.
 {"regex": "api|graphql|admin"}
 ```
 
+### `search_proxy_http_history`
+
+Finds where a regex matches and returns the hit with its context. Reach for it when a value sits deep inside a large response: a leaked key, a token, an error string.
+
+```json
+{"regex": "AKIA[0-9A-Z]{16}", "count": 5, "offset": 0}
+```
+
+Parameters:
+
+- `regex`: the pattern to find.
+- `parts`: `request`, `response`, `requestHeaders`, `requestBody`, `responseHeaders`, `responseBody`. Default: response body plus the whole request.
+- `contextChars`: characters either side of the hit. Default 40, maximum 200.
+- `maxPerItem`: hits per item. Default 3, maximum 10.
+- `maxScanBytes`: characters scanned per message. Default 2000000, maximum 10000000.
+- `count`, `offset`, `newestFirst`: paging over matching items, same caps as the other list tools.
+
+Each row is `index`, `id`, `method`, `host`, `path`, `statusCode`, `matches`. Each hit is `message`, `part`, `offset`, `matchLength`, `context`. `part` tells you how to read the offset: `body` offsets go to `get_proxy_http_history_body` or `_message_slice` with `part=body`; `full` offsets go to `_message_slice` with `part=full`.
+
+`totalMatches` counts the items Burp's native scan matched, so paging stays cheap. `scanTruncated` marks a message scanned only up to `maxScanBytes`; `timedOut` means the call stopped at its 5 second budget and the page is partial. It never returns full messages: ask for a slice when the context is not enough.
+
 ### `get_latest_proxy_http_history`
 
 Returns newest proxy HTTP history entries without calculating offsets.

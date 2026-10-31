@@ -110,6 +110,18 @@ Use compact fields first:
 
 Avoid `request` and `response` during broad scans. They can be huge.
 
+## Finding a Value in Context
+
+When you know what the value looks like but not where it lives, search instead of paging:
+
+```json
+{"regex": "AKIA[0-9A-Z]{16}", "count": 5, "offset": 0}
+```
+
+Tool: `search_proxy_http_history`. Each hit gives `message`, `part`, `offset` and 40 characters of context either side. Widen it by feeding the offset to `get_proxy_http_history_body` (part `body`) or `get_proxy_http_history_message_slice` with `part` `full`.
+
+Do not page item dumps or body slices hunting for a value that one search finds.
+
 ## Pulling Message Data
 
 When a candidate index looks interesting, use bounded slices.

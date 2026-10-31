@@ -848,6 +848,271 @@ class ToolsKtTest {
             envelope.getValue("items").jsonArray.map { it.jsonObject }
 
         @Test
+        fun `search proxy http history should report a body offset usable by the body slice`() {
+            val proxy = mockk<Proxy>()
+            val requestText = "GET /assets/vendor.js HTTP/1.1\r\nHost: static.localhost\r\n\r\n"
+            val body = "x".repeat(500) + "AKIAQ3EXAMPLEKEY7777" + "y".repeat(500)
+            val item = historyItem(requestText, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n\r\n$body")
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(item)
+
+            runBlocking {
+                val text = client.callTool(
+                    "search_proxy_http_history",
+                    mapOf("regex" to "AKIAQ3EXAMPLEKEY7777", "count" to 5, "offset" to 0)
+                ).expectTextContent()
+                val envelope = jsonOf(text)
+
+                assertEquals(1, envelope.getValue("totalMatches").jsonPrimitive.content.toInt())
+                val row = itemsOf(envelope).single()
+                assertEquals(1, row.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals("GET", row.getValue("method").jsonPrimitive.content)
+                assertEquals("static.localhost", row.getValue("host").jsonPrimitive.content)
+                assertEquals(200, row.getValue("statusCode").jsonPrimitive.content.toInt())
+
+                val hit = row.getValue("matches").jsonArray.single().jsonObject
+                assertEquals("response", hit.getValue("message").jsonPrimitive.content)
+                assertEquals("body", hit.getValue("part").jsonPrimitive.content)
+                assertEquals(500, hit.getValue("offset").jsonPrimitive.content.toInt())
+                assertEquals(20, hit.getValue("matchLength").jsonPrimitive.content.toInt())
+                assertTrue(hit.getValue("context").jsonPrimitive.content.contains("AKIAQ3EXAMPLEKEY7777"))
+
+                val sliced = client.callTool(
+                    "get_proxy_http_history_body",
+                    mapOf(
+                        "index" to 1,
+                        "message" to "response",
+                        "offset" to hit.getValue("offset").jsonPrimitive.content.toInt(),
+                        "length" to hit.getValue("matchLength").jsonPrimitive.content.toInt()
+                    )
+                ).expectTextContent()
+
+                assertEquals("AKIAQ3EXAMPLEKEY7777", sliced)
+            }
+        }
+
+        @Test
+        fun `search proxy http history should report request header offsets usable by the message slice`() {
+            val proxy = mockk<Proxy>()
+            val requestText = "GET /x HTTP/1.1\r\nHost: example.test\r\nX-Token: SECRET123\r\n\r\n"
+            val item = historyItem(requestText, "HTTP/1.1 200 OK\r\n\r\n")
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(item)
+
+            runBlocking {
+                val row = itemsOf(
+                    jsonOf(
+                        client.callTool(
+                            "search_proxy_http_history",
+                            mapOf("regex" to "SECRET123", "count" to 5, "offset" to 0)
+                        ).expectTextContent()
+                    )
+                ).single()
+
+                val hit = row.getValue("matches").jsonArray.single().jsonObject
+                assertEquals("request", hit.getValue("message").jsonPrimitive.content)
+                assertEquals("full", hit.getValue("part").jsonPrimitive.content)
+
+                val sliced = client.callTool(
+                    "get_proxy_http_history_message_slice",
+                    mapOf(
+                        "index" to 1,
+                        "message" to "request",
+                        "part" to "full",
+                        "offset" to hit.getValue("offset").jsonPrimitive.content.toInt(),
+                        "length" to 9
+                    )
+                ).expectTextContent()
+
+                assertEquals("SECRET123", sliced)
+            }
+        }
+
+        @Test
+        fun `search proxy http history should bound the context window`() {
+            val proxy = mockk<Proxy>()
+            val body = "0123456789NEEDLEabcdefghij"
+            val item = historyItem("GET /page HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n$body")
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(item)
+
+            runBlocking {
+                val hit = itemsOf(
+                    jsonOf(
+                        client.callTool(
+                            "search_proxy_http_history",
+                            mapOf("regex" to "NEEDLE", "contextChars" to 3, "count" to 5, "offset" to 0)
+                        ).expectTextContent()
+                    )
+                ).single().getValue("matches").jsonArray.single().jsonObject
+
+                assertEquals("789NEEDLEabc", hit.getValue("context").jsonPrimitive.content)
+
+                val rejected = client.callTool(
+                    "search_proxy_http_history",
+                    mapOf("regex" to "NEEDLE", "contextChars" to 500, "count" to 5, "offset" to 0)
+                ).expectTextContent()
+                assertTrue(rejected.contains("contextChars must be between 0 and 200"))
+            }
+        }
+
+        @Test
+        fun `search proxy http history should cap matches per item`() {
+            val proxy = mockk<Proxy>()
+            val body = (1..5).joinToString(" ") { "needle$it" }
+            val item = historyItem("GET /page HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n$body")
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(item)
+
+            runBlocking {
+                val row = itemsOf(
+                    jsonOf(
+                        client.callTool(
+                            "search_proxy_http_history",
+                            mapOf("regex" to "needle", "maxPerItem" to 2, "count" to 5, "offset" to 0)
+                        ).expectTextContent()
+                    )
+                ).single()
+
+                assertEquals(2, row.getValue("matches").jsonArray.size)
+
+                val rejected = client.callTool(
+                    "search_proxy_http_history",
+                    mapOf("regex" to "needle", "maxPerItem" to 11, "count" to 5, "offset" to 0)
+                ).expectTextContent()
+                assertTrue(rejected.contains("maxPerItem must be between 1 and 10"))
+            }
+        }
+
+        @Test
+        fun `search proxy http history should use global indices for paging`() {
+            val proxy = mockk<Proxy>()
+            val items = listOf(
+                historyItem("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\nplain"),
+                historyItem("GET /second HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\nMARKER one"),
+                historyItem("GET /third HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\nMARKER two")
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns items
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(items[1], items[2])
+
+            runBlocking {
+                val firstPage = jsonOf(
+                    client.callTool(
+                        "search_proxy_http_history",
+                        mapOf("regex" to "MARKER", "count" to 1, "offset" to 0)
+                    ).expectTextContent()
+                )
+                val firstRow = itemsOf(firstPage).single()
+
+                assertEquals(2, firstPage.getValue("totalMatches").jsonPrimitive.content.toInt())
+                assertEquals(true, firstPage.getValue("hasMore").jsonPrimitive.content.toBoolean())
+                assertEquals(2, firstRow.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals("/second", firstRow.getValue("path").jsonPrimitive.content)
+
+                val secondPage = jsonOf(
+                    client.callTool(
+                        "search_proxy_http_history",
+                        mapOf("regex" to "MARKER", "count" to 1, "offset" to 1)
+                    ).expectTextContent()
+                )
+                val secondRow = itemsOf(secondPage).single()
+
+                assertEquals(false, secondPage.getValue("hasMore").jsonPrimitive.content.toBoolean())
+                assertEquals(3, secondRow.getValue("index").jsonPrimitive.content.toInt())
+
+                val newest = itemsOf(
+                    jsonOf(
+                        client.callTool(
+                            "search_proxy_http_history",
+                            mapOf("regex" to "MARKER", "count" to 1, "offset" to 0, "newestFirst" to true)
+                        ).expectTextContent()
+                    )
+                ).single()
+                assertEquals(3, newest.getValue("index").jsonPrimitive.content.toInt())
+            }
+        }
+
+        @Test
+        fun `search proxy http history should report zero matches`() {
+            val proxy = mockk<Proxy>()
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(
+                historyItem("GET /only HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\nplain")
+            )
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns emptyList()
+
+            runBlocking {
+                val text = client.callTool(
+                    "search_proxy_http_history", mapOf("regex" to "ABSENT", "count" to 5, "offset" to 0)
+                ).expectTextContent()
+                val envelope = jsonOf(text)
+
+                assertEquals(0, envelope.getValue("totalMatches").jsonPrimitive.content.toInt())
+                assertEquals(0, envelope.getValue("returned").jsonPrimitive.content.toInt())
+                assertTrue(envelope.getValue("items").jsonArray.isEmpty())
+            }
+        }
+
+        @Test
+        fun `search proxy http history should flag a truncated scan`() {
+            val proxy = mockk<Proxy>()
+            val body = "z".repeat(3_000) + "NEEDLE"
+            val item = historyItem("GET /big HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n$body")
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(item)
+
+            runBlocking {
+                val row = itemsOf(
+                    jsonOf(
+                        client.callTool(
+                            "search_proxy_http_history",
+                            mapOf("regex" to "NEEDLE", "maxScanBytes" to 1_024, "count" to 5, "offset" to 0)
+                        ).expectTextContent()
+                    )
+                ).single()
+
+                assertEquals(true, row.getValue("scanTruncated").jsonPrimitive.content.toBoolean())
+                assertTrue(row.getValue("matches").jsonArray.isEmpty())
+            }
+        }
+
+        @Test
+        fun `search proxy http history should reject unknown parts`() {
+            runBlocking {
+                val text = client.callTool(
+                    "search_proxy_http_history",
+                    mapOf("regex" to "needle", "parts" to listOf("cookies"), "count" to 5, "offset" to 0)
+                ).expectTextContent()
+
+                assertTrue(text.contains("parts must be a subset of"))
+            }
+        }
+
+        @Test
+        fun `deadline checked text should abort a scan past its budget`() {
+            assertThrows(ScanTimeout::class.java) {
+                DeadlineCheckedText("abcdef", 0L).get(0)
+            }
+
+            val region = SearchRegion("response", "full", "a".repeat(100), 0, 50)
+            assertThrows(ScanTimeout::class.java) {
+                collectMessageMatches(listOf(region), Pattern.compile("a"), 5, 3, 1_000, 0L)
+            }
+        }
+
+        @Test
         fun `get proxy history should paginate properly`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(

@@ -18,6 +18,8 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -48,6 +50,14 @@ internal const val MAX_PAGE_COUNT = 500
 internal const val MAX_SLICE_LENGTH = 200_000
 internal const val MAX_BODY_PREVIEW_LENGTH = 20_000
 internal const val MAX_RESPONSE_TEXT_LENGTH = 200_000
+internal const val MAX_MATCHES_PER_ITEM = 10
+internal const val DEFAULT_MATCHES_PER_ITEM = 3
+internal const val MAX_CONTEXT_CHARS = 200
+internal const val DEFAULT_CONTEXT_CHARS = 40
+internal const val MAX_SEARCH_SCAN_BYTES = 10_000_000
+internal const val MIN_SEARCH_SCAN_BYTES = 1_024
+internal const val DEFAULT_SEARCH_SCAN_BYTES = 2_000_000
+private const val SEARCH_TIME_BUDGET_NANOS = 5_000_000_000L
 
 private const val MIN_PAGE_COUNT = 1
 
@@ -529,6 +539,165 @@ internal fun findHistoryMatches(api: MontoyaApi, pattern: Pattern): HistoryMatch
 }
 
 // ---------------------------------------------------------------------------
+// Regex search with context
+// ---------------------------------------------------------------------------
+
+/** Aborts a native scan when the call's time budget is spent. */
+internal class ScanTimeout : RuntimeException(null, null, false, false)
+
+/**
+ * CharSequence view over message text that checks the deadline every [CHECK_MASK] characters and
+ * throws [ScanTimeout] once the budget is spent. A pathological pattern then costs a partial result
+ * instead of a hung call.
+ */
+internal class DeadlineCheckedText(
+    private val delegate: CharSequence,
+    private val deadlineNanos: Long,
+) : CharSequence {
+    override val length: Int get() = delegate.length
+
+    override fun get(index: Int): Char {
+        if (index and CHECK_MASK == 0 && System.nanoTime() > deadlineNanos) throw ScanTimeout()
+        return delegate[index]
+    }
+
+    override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
+        DeadlineCheckedText(delegate.subSequence(startIndex, endIndex), deadlineNanos)
+
+    override fun toString(): String = delegate.toString()
+
+    private companion object {
+        const val CHECK_MASK = 0x3FFF
+    }
+}
+
+/** Which regions of a message a search covers. */
+internal data class SearchParts(
+    val request: Boolean = false,
+    val response: Boolean = false,
+    val requestHeaders: Boolean = false,
+    val requestBody: Boolean = false,
+    val responseHeaders: Boolean = false,
+    val responseBody: Boolean = false,
+)
+
+internal val SEARCH_PART_NAMES = listOf(
+    "request", "response", "requestHeaders", "requestBody", "responseHeaders", "responseBody",
+)
+
+/**
+ * Parses the `parts` parameter. Without one, the response body plus the whole request are searched,
+ * which is where leaked values usually live.
+ */
+internal fun parseSearchParts(names: List<String>?): SearchParts? {
+    val selected = names?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }?.toSet()
+    if (selected.isNullOrEmpty()) return SearchParts(request = true, responseBody = true)
+
+    if (selected.any { name -> SEARCH_PART_NAMES.none { it.equals(name, ignoreCase = true) } }) return null
+
+    return SearchParts(
+        request = "request" in selected,
+        response = "response" in selected,
+        requestHeaders = "requestheaders" in selected,
+        requestBody = "requestbody" in selected,
+        responseHeaders = "responseheaders" in selected,
+        responseBody = "responsebody" in selected,
+    )
+}
+
+/** A contiguous piece of a message that a search scans, with the coordinates a hit maps back to. */
+internal class SearchRegion(
+    val message: String,
+    val scope: String,
+    val text: String,
+    val baseOffset: Int,
+    val bodyStart: Int,
+)
+
+/**
+ * Builds the regions to scan for one message.
+ *
+ * `request`/`response` cover the whole message. Header-only and body-only selections exist because a
+ * hit in the request line or headers and a hit in the body are addressed by different tools.
+ */
+internal fun messageSearchRegions(messageName: String, text: String?, parts: SearchParts): List<SearchRegion> {
+    if (text.isNullOrEmpty()) return emptyList()
+
+    val bodyStart = bodyOffset(text)
+    val whole = if (messageName == "request") parts.request else parts.response
+    val headers = if (messageName == "request") parts.requestHeaders else parts.responseHeaders
+    val body = if (messageName == "request") parts.requestBody else parts.responseBody
+
+    val regions = ArrayList<SearchRegion>(2)
+    if (whole) {
+        regions.add(SearchRegion(messageName, "full", text, 0, bodyStart))
+    } else {
+        if (headers) regions.add(SearchRegion(messageName, "headers", text.substring(0, bodyStart), 0, bodyStart))
+        if (body) regions.add(SearchRegion(messageName, "body", text.substring(bodyStart), bodyStart, bodyStart))
+    }
+    return regions
+}
+
+/** Matched text plus [contextChars] characters either side, clamped to the message. */
+internal fun contextWindow(text: String, start: Int, end: Int, contextChars: Int): String {
+    val from = (start - contextChars).coerceAtLeast(0)
+    val to = (end + contextChars).coerceAtMost(text.length)
+    return text.substring(from, to)
+}
+
+/**
+ * Locates up to [maxPerItem] hits per message.
+ *
+ * Offsets are directly consumable: `part = "body"` offsets are body-relative (feed them to
+ * `get_proxy_http_history_body` or `_message_slice` with `part = "body"`), while `part = "full"`
+ * offsets are message-relative (feed them to `_message_slice` with `part = "full"`). Scanning stops
+ * at [maxScanBytes] characters per region and on the caller's deadline.
+ */
+internal fun collectMessageMatches(
+    regions: List<SearchRegion>,
+    pattern: Pattern,
+    contextChars: Int,
+    maxPerItem: Int,
+    maxScanBytes: Int,
+    deadlineNanos: Long,
+): Pair<JsonArray, Boolean> {
+    val hits = ArrayList<JsonElement>(maxPerItem)
+    var truncated = false
+
+    for (region in regions) {
+        if (hits.size >= maxPerItem) break
+        if (region.text.isEmpty()) continue
+
+        val scanLength = region.text.length.coerceAtMost(maxScanBytes)
+        if (scanLength < region.text.length) truncated = true
+
+        val scanned: CharSequence = if (scanLength == region.text.length) {
+            region.text
+        } else {
+            region.text.substring(0, scanLength)
+        }
+        val matcher = pattern.matcher(DeadlineCheckedText(scanned, deadlineNanos))
+
+        while (hits.size < maxPerItem && matcher.find()) {
+            val absoluteStart = region.baseOffset + matcher.start()
+            val absoluteEnd = region.baseOffset + matcher.end()
+            val inBody = region.scope == "body" || (region.scope == "full" && absoluteStart >= region.bodyStart)
+            hits.add(
+                buildJsonObject {
+                    put("message", region.message)
+                    put("part", if (inBody) "body" else "full")
+                    put("offset", if (inBody) absoluteStart - region.bodyStart else absoluteStart)
+                    put("matchLength", absoluteEnd - absoluteStart)
+                    put("context", contextWindow(region.text, matcher.start(), matcher.end(), contextChars))
+                }
+            )
+        }
+    }
+
+    return JsonArray(hits) to truncated
+}
+
+// ---------------------------------------------------------------------------
 // Request mutation
 // ---------------------------------------------------------------------------
 
@@ -819,6 +988,84 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val matches = findHistoryMatches(api, pattern)
         val ordered = if (newestFirst) matches.indices.asReversed() else matches.indices
         ordered.asSequence().map { index -> serializeHistoryItem(index, matches.items[index - 1], fields) }
+    }
+
+    mcpTool<SearchProxyHttpHistory>(
+        "Finds where a regex matches inside the proxy HTTP history and shows the surrounding text, without dumping messages. " +
+            "Use it when a value sits deep inside a large response: one call returns the item's global 'index', method/host/path/status, " +
+            "and up to maxPerItem hits per item, each with the message it matched ('request'/'response'), the part ('body' or 'full'), " +
+            "an offset you can pass straight to get_proxy_http_history_body or get_proxy_http_history_message_slice, and 'context' characters either side. " +
+            "Burp's native scan picks the items, so 'totalMatches' is cheap; hits are located in 'parts' only (default: response body plus the whole request). " +
+            "Scans stop at maxScanBytes per message and after a 5 second budget: 'scanTruncated' and 'timedOut' mark a partial result."
+    ) {
+        countLimitError(count)?.let { return@mcpTool it }
+        if (offset < 0) return@mcpTool "offset must not be negative"
+        if (contextChars !in 0..MAX_CONTEXT_CHARS) {
+            return@mcpTool "contextChars must be between 0 and $MAX_CONTEXT_CHARS"
+        }
+        if (maxPerItem !in 1..MAX_MATCHES_PER_ITEM) {
+            return@mcpTool "maxPerItem must be between 1 and $MAX_MATCHES_PER_ITEM"
+        }
+        if (maxScanBytes !in MIN_SEARCH_SCAN_BYTES..MAX_SEARCH_SCAN_BYTES) {
+            return@mcpTool "maxScanBytes must be between $MIN_SEARCH_SCAN_BYTES and $MAX_SEARCH_SCAN_BYTES"
+        }
+
+        val selectedParts = parseSearchParts(parts)
+            ?: return@mcpTool "parts must be a subset of: ${SEARCH_PART_NAMES.joinToString(", ")}"
+
+        val allowed = checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history search")
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val pattern = runCatching { Pattern.compile(regex) }.getOrNull()
+            ?: return@mcpTool "$REGEX_ERROR_PREFIX$regex"
+
+        val matches = findHistoryMatches(api, pattern)
+        val ordered = if (newestFirst) matches.indices.asReversed() else matches.indices
+        val page = ordered.drop(offset).take(count)
+        val deadlineNanos = System.nanoTime() + SEARCH_TIME_BUDGET_NANOS
+
+        val rows = ArrayList<JsonElement>(page.size)
+        var timedOut = false
+
+        for (historyIndex in page) {
+            val item = matches.items[historyIndex - 1]
+            val regions = buildList {
+                addAll(messageSearchRegions("request", item.request()?.toString(), selectedParts))
+                addAll(messageSearchRegions("response", item.response()?.toString(), selectedParts))
+            }
+
+            val (rowMatches, scanTruncated) = try {
+                collectMessageMatches(regions, pattern, contextChars, maxPerItem, maxScanBytes, deadlineNanos)
+            } catch (_: ScanTimeout) {
+                api.logging().logToOutput("MCP history search stopped at its time budget")
+                timedOut = true
+                break
+            }
+
+            rows.add(
+                buildJsonObject {
+                    put("index", historyIndex)
+                    put("id", item.id())
+                    put("method", item.method())
+                    put("host", item.host())
+                    put("path", item.path())
+                    put("statusCode", item.response()?.statusCode()?.toInt()?.let { JsonPrimitive(it) } ?: JsonNull)
+                    if (scanTruncated) put("scanTruncated", true)
+                    put("matches", rowMatches)
+                }
+            )
+        }
+
+        buildJsonObject {
+            put("totalMatches", matches.indices.size)
+            put("offset", offset)
+            put("returned", rows.size)
+            put("hasMore", offset + rows.size < matches.indices.size)
+            if (timedOut) put("timedOut", true)
+            put("items", JsonArray(rows))
+        }.toString()
     }
 
     mcpTool<GetProxyHttpHistoryCount>(
@@ -1340,6 +1587,18 @@ data class GetProxyHttpHistoryRegex(
     override val offset: Int,
     val newestFirst: Boolean = false,
     val fields: List<String>? = null,
+) : Paginated
+
+@Serializable
+data class SearchProxyHttpHistory(
+    val regex: String,
+    val parts: List<String>? = null,
+    val contextChars: Int = DEFAULT_CONTEXT_CHARS,
+    val maxPerItem: Int = DEFAULT_MATCHES_PER_ITEM,
+    val maxScanBytes: Int = DEFAULT_SEARCH_SCAN_BYTES,
+    override val count: Int,
+    override val offset: Int,
+    val newestFirst: Boolean = false,
 ) : Paginated
 
 @Serializable
