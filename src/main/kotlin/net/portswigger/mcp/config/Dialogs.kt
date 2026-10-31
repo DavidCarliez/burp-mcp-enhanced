@@ -3,9 +3,14 @@ package net.portswigger.mcp.config
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.ui.editor.EditorOptions
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.awt.*
 import java.awt.event.ActionEvent
 import java.awt.event.KeyEvent
+import java.awt.event.WindowAdapter
+import java.awt.event.WindowEvent
 import javax.swing.*
 import javax.swing.border.EmptyBorder
 
@@ -55,6 +60,29 @@ object Dialogs {
             )
             rootPane.actionMap.put("escape", escapeAction)
         }
+    }
+
+    /**
+     * Makes a dialog visible above Burp's main frame.
+     *
+     * Modal dialogs are not raised by the window manager on a display without one (e.g. Xvfb), which
+     * leaves waiting MCP calls stuck behind the suite frame with no visible prompt. Always-on-top is
+     * requested from `windowOpened`, when the window is mapped and the display's window manager can
+     * be queried, and only when it is supported: setting it on an unrealized window, or on a display
+     * without a window manager, throws and kills the pending approval. The raise/focus requests are
+     * also issued from `windowOpened`, because anything queued after `setVisible(true)` only runs
+     * once the dialog has been closed.
+     */
+    private fun raiseOnOpen(dialog: JDialog) {
+        dialog.addWindowListener(object : WindowAdapter() {
+            override fun windowOpened(e: WindowEvent?) {
+                if (dialog.isAlwaysOnTopSupported) {
+                    dialog.isAlwaysOnTop = true
+                }
+                dialog.toFront()
+                dialog.requestFocus()
+            }
+        })
     }
 
     fun showMessageDialog(
@@ -121,6 +149,7 @@ object Dialogs {
         dialog.contentPane = contentPanel
         dialog.pack()
         dialog.setLocationRelativeTo(parent)
+        raiseOnOpen(dialog)
         dialog.isVisible = true
     }
 
@@ -192,6 +221,7 @@ object Dialogs {
         dialog.contentPane = contentPanel
         dialog.pack()
         dialog.setLocationRelativeTo(parent)
+        raiseOnOpen(dialog)
         dialog.isVisible = true
 
         return result
@@ -272,6 +302,7 @@ object Dialogs {
         dialog.contentPane = contentPanel
         dialog.pack()
         dialog.setLocationRelativeTo(parent)
+        raiseOnOpen(dialog)
 
         SwingUtilities.invokeLater {
             inputField.requestFocusInWindow()
@@ -282,12 +313,36 @@ object Dialogs {
         return result
     }
 
-    fun showOptionDialog(
+    suspend fun requestOption(
         parent: Component?,
         message: String,
         options: Array<String>,
         requestContent: String? = null,
         api: MontoyaApi? = null
+    ): Int = suspendCancellableCoroutine { continuation ->
+        SwingUtilities.invokeLater {
+            if (!continuation.isActive) return@invokeLater
+            try {
+                val result = showOptionDialog(parent, message, options, requestContent, api) { dialog ->
+                    continuation.invokeOnCancellation {
+                        SwingUtilities.invokeLater { dialog.dispose() }
+                    }
+                    continuation.isActive
+                }
+                continuation.resume(result)
+            } catch (error: Exception) {
+                continuation.resumeWithException(error)
+            }
+        }
+    }
+
+    fun showOptionDialog(
+        parent: Component?,
+        message: String,
+        options: Array<String>,
+        requestContent: String? = null,
+        api: MontoyaApi? = null,
+        onShow: (JDialog) -> Boolean = { true }
     ): Int {
         val dialog = createDialog(parent)
         var result = -1
@@ -455,10 +510,6 @@ object Dialogs {
 
         if (parent != null && parent.isDisplayable) {
             dialog.setLocationRelativeTo(parent)
-
-            dialog.isAlwaysOnTop = true
-            dialog.toFront()
-            dialog.requestFocus()
         } else {
             val screenSize = Toolkit.getDefaultToolkit().screenSize
             val dialogSize = dialog.size
@@ -467,12 +518,12 @@ object Dialogs {
             )
         }
 
-        dialog.isVisible = true
+        raiseOnOpen(dialog)
 
-        SwingUtilities.invokeLater {
-            dialog.isAlwaysOnTop = false
-            dialog.toFront()
-        }
+        if (onShow(dialog)) dialog.isVisible = true
+        else dialog.dispose()
+
+        dialog.isAlwaysOnTop = false
 
         return result
     }

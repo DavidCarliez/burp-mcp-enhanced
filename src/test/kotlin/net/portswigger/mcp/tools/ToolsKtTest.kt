@@ -15,6 +15,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
+import burp.api.montoya.proxy.ProxyHistoryFilter
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import burp.api.montoya.utilities.Base64Utils
 import burp.api.montoya.utilities.RandomUtils
@@ -24,24 +25,30 @@ import io.mockk.*
 import java.net.InetAddress
 import java.time.ZonedDateTime
 import java.util.Optional
-import io.modelcontextprotocol.kotlin.sdk.CallToolResultBase
-import io.modelcontextprotocol.kotlin.sdk.TextContent
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import net.portswigger.mcp.KtorServerManager
 import net.portswigger.mcp.ServerState
 import net.portswigger.mcp.TestSseMcpClient
 import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.schema.HttpRequestResponse
 import net.portswigger.mcp.schema.toSerializableForm
+import net.portswigger.mcp.security.HttpRequestSecurity
+import net.portswigger.mcp.security.UserApprovalHandler
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.net.ServerSocket
+import java.util.regex.Pattern
 import javax.swing.JTextArea
 
 class ToolsKtTest {
@@ -54,15 +61,14 @@ class ToolsKtTest {
     private val config: McpConfig
     private val mockHeaders = mutableListOf<HttpHeader>()
     private val capturedRequest = slot<HttpRequest>()
-
-    init {
-        val persistedObject = mockk<PersistedObject>().apply {
+    private val persistedConfig: PersistedObject = mockk<PersistedObject>().apply {
             every { getBoolean("enabled") } returns true
             every { getBoolean("configEditingTooling") } returns true
             every { getBoolean("requireHttpRequestApproval") } returns false
-            every { getBoolean("requireHistoryAccessApproval") } returns false
+            every { getBoolean("requireDataAccessApproval") } returns false
             every { getBoolean("_alwaysAllowHttpHistory") } returns false
             every { getBoolean("_alwaysAllowWebSocketHistory") } returns false
+            every { getBoolean("_alwaysAllowOrganizer") } returns false
             every { getString("host") } returns "127.0.0.1"
             every { getString("_autoApproveTargets") } returns ""
             every { getInteger("port") } returns testPort
@@ -70,19 +76,22 @@ class ToolsKtTest {
             every { setString(any(), any()) } returns Unit
             every { setInteger(any(), any()) } returns Unit
         }
+    private var historyItemCounter = 1
+
+    init {
         val mockLogging = mockk<Logging>().apply {
             every { logToError(any<String>()) } returns Unit
             every { logToOutput(any<String>()) } returns Unit
         }
 
-        config = McpConfig(persistedObject, mockLogging)
+        config = McpConfig(persistedConfig, mockLogging)
         
         mockkStatic(HttpHeader::class)
         mockkStatic(burp.api.montoya.http.HttpService::class)
         mockkStatic(HttpRequest::class)
     }
 
-    private fun CallToolResultBase?.expectTextContent(
+    private fun CallToolResult?.expectTextContent(
         expected: String? = null,
     ): String {
         assertNotNull(this, "Tool result cannot be null")
@@ -174,7 +183,9 @@ class ToolsKtTest {
                 }
             }
             every { api.http() } returns httpService
-            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
+            val httpMessage = mockk<burp.api.montoya.http.message.responses.HttpResponse>()
+            every { httpMessage.toString() } returns "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
+            every { httpResponse.response() } returns httpMessage
             every { httpService.sendRequest(capture(capturedRequest)) } returns httpResponse
 
             runBlocking {
@@ -236,7 +247,9 @@ class ToolsKtTest {
             val bodySlot = slot<String>()
 
             every { HttpRequest.http2Request(any(), capture(headersSlot), capture(bodySlot)) } returns httpRequest
-            every { httpResponse.toString() } returns "HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
+            val httpMessage = mockk<burp.api.montoya.http.message.responses.HttpResponse>()
+            every { httpMessage.toString() } returns "HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse body"
+            every { httpResponse.response() } returns httpMessage
             every { api.http() } returns httpService
             every { httpService.sendRequest(capture(requestSlot), HttpMode.HTTP_2) } returns httpResponse
 
@@ -319,7 +332,9 @@ class ToolsKtTest {
             val headersSlot = slot<List<HttpHeader>>()
 
             every { HttpRequest.http2Request(any(), capture(headersSlot), any<String>()) } returns httpRequest
-            every { httpResponse.toString() } returns "HTTP/2 200 OK"
+            val httpMessage = mockk<burp.api.montoya.http.message.responses.HttpResponse>()
+            every { httpMessage.toString() } returns "HTTP/2 200 OK"
+            every { httpResponse.response() } returns httpMessage
             every { api.http() } returns httpService
             every { httpService.sendRequest(any(), HttpMode.HTTP_2) } returns httpResponse
 
@@ -352,12 +367,53 @@ class ToolsKtTest {
             
             val expectedOrder = listOf(":scheme", ":method", ":path", ":authority")
             for (i in 0 until minOf(expectedOrder.size, pseudoHeaderNames.size)) {
-                assertEquals(expectedOrder[i], pseudoHeaderNames[i], 
+                assertEquals(expectedOrder[i], pseudoHeaderNames[i],
                     "Pseudo headers should follow the order: scheme, method, path, authority")
             }
         }
+
+        @Test
+        fun `create repeater tab http2 should build http2 request`() {
+            val repeater = mockk<burp.api.montoya.repeater.Repeater>(relaxed = true)
+            val httpRequest = mockk<HttpRequest>()
+            val headersSlot = slot<List<HttpHeader>>()
+            val bodySlot = slot<String>()
+
+            every { HttpRequest.http2Request(any(), capture(headersSlot), capture(bodySlot)) } returns httpRequest
+            every { api.repeater() } returns repeater
+
+            val pseudoHeaders = mapOf(
+                "method" to "POST", "path" to "/api/x", "authority" to "example.com", "scheme" to "https"
+            )
+            val headers = mapOf("Content-Type" to "application/json")
+            val requestBody = "{\"k\":\"v\"}"
+
+            runBlocking {
+                val result = client.callTool(
+                    "create_repeater_tab_http2", mapOf(
+                        "tabName" to "h2-tab",
+                        "pseudoHeaders" to Json.encodeToJsonElement(pseudoHeaders),
+                        "headers" to Json.encodeToJsonElement(headers),
+                        "requestBody" to requestBody,
+                        "targetHostname" to "example.com",
+                        "targetPort" to 443,
+                        "usesHttps" to true
+                    )
+                )
+
+                delay(100)
+                assertNotNull(result)
+            }
+
+            verify(exactly = 1) { repeater.sendToRepeater(httpRequest, "h2-tab") }
+            assertEquals("{\"k\":\"v\"}", bodySlot.captured, "Request body should be passed through unchanged")
+
+            val pseudoHeaderNames = headersSlot.captured.filter { it.name().startsWith(":") }.map { it.name() }
+            assertEquals(listOf(":scheme", ":method", ":path", ":authority"), pseudoHeaderNames)
+            assertTrue(headersSlot.captured.any { it.name() == "content-type" && it.value() == "application/json" })
+        }
     }
-    
+
     @Nested
     inner class UtilityToolsTests {
         @Test
@@ -690,73 +746,215 @@ class ToolsKtTest {
             verify(exactly = 1) { textArea.text = "New content" }
         }
     }
-    
-    @Nested
+        @Nested
     inner class PaginatedToolsTests {
+
+        private fun parsedHeaders(raw: String): List<Pair<String, String>> =
+            raw.lineSequence().drop(1).takeWhile { it.isNotBlank() }.mapNotNull { line ->
+                val separator = line.indexOf(':')
+                if (separator < 0) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+            }.toList()
+
+        private fun parsedHeader(raw: String, name: String): String? =
+            parsedHeaders(raw).firstOrNull { it.first.equals(name, ignoreCase = true) }?.second
+
+        private fun parsedBody(raw: String): String {
+            val crlf = raw.indexOf("\r\n\r\n")
+            if (crlf >= 0) return raw.substring(crlf + 4)
+            val lf = raw.indexOf("\n\n")
+            return if (lf >= 0) raw.substring(lf + 2) else ""
+        }
+
+        private fun byteArrayOfLength(length: Int): ByteArray =
+            mockk { every { length() } returns length }
+
+        private fun requestMock(raw: String): HttpRequest {
+            val requestLine = raw.lineSequence().first()
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+            val hostHeader = parsedHeader(raw, "Host") ?: "example.test:80"
+
+            val service = mockk<burp.api.montoya.http.HttpService>()
+            every { service.host() } returns hostHeader.substringBefore(':')
+            every { service.port() } returns (hostHeader.substringAfter(':', "80").toIntOrNull() ?: 80)
+            every { service.secure() } returns false
+
+            val request = mockk<HttpRequest>()
+            every { request.toString() } returns raw
+            every { request.bodyToString() } returns parsedBody(raw)
+            every { request.body() } returns byteArrayOfLength(parsedBody(raw).toByteArray().size)
+            every { request.headerValue(any()) } answers { parsedHeader(raw, firstArg()) }
+            every { request.hasHeader(any<String>()) } answers { parsedHeader(raw, firstArg()) != null }
+            every { request.httpService() } returns service
+            every { request.url() } returns "http://$hostHeader$path"
+            every { request.withPath(any()) } answers { request }
+            every { request.withBody(any<String>()) } answers { request }
+            every { request.withUpdatedHeader(any(), any()) } answers { request }
+            every { request.withAddedHeader(any(), any()) } answers { request }
+            return request
+        }
+
+        private fun responseMock(raw: String): burp.api.montoya.http.message.responses.HttpResponse {
+            val status = raw.lineSequence().first().split(" ").getOrNull(1)?.toIntOrNull() ?: 200
+            val response = mockk<burp.api.montoya.http.message.responses.HttpResponse>()
+            every { response.toString() } returns raw
+            every { response.statusCode() } returns status.toShort()
+            every { response.bodyToString() } returns parsedBody(raw)
+            every { response.body() } returns byteArrayOfLength(parsedBody(raw).toByteArray().size)
+            every { response.headerValue(any()) } answers { parsedHeader(raw, firstArg()) }
+            return response
+        }
+
+        private fun sendResultMock(responseText: String): burp.api.montoya.http.message.HttpRequestResponse {
+            val result = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+            every { result.response() } returns responseMock(responseText)
+            return result
+        }
+
+        private fun historyItem(
+            requestText: String,
+            responseText: String? = null,
+            notes: String? = null,
+            request: HttpRequest = requestMock(requestText),
+            response: burp.api.montoya.http.message.responses.HttpResponse? =
+                responseText?.let { responseMock(it) },
+        ): ProxyHttpRequestResponse {
+            val requestLine = requestText.lineSequence().first()
+            val hostHeader = parsedHeader(requestText, "Host") ?: "example.test:80"
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+
+            val annotations = mockk<Annotations>()
+            every { annotations.notes() } returns notes
+
+            val item = mockk<ProxyHttpRequestResponse>()
+            every { item.id() } returns historyItemCounter++
+            every { item.method() } returns requestLine.substringBefore(' ')
+            every { item.host() } returns hostHeader.substringBefore(':')
+            every { item.port() } returns (hostHeader.substringAfter(':', "80").toIntOrNull() ?: 80)
+            every { item.path() } returns path
+            every { item.url() } returns "http://$hostHeader$path"
+            every { item.request() } returns request
+            every { item.response() } returns response
+            every { item.annotations() } returns annotations
+            every { item.mimeType() } returns burp.api.montoya.http.message.MimeType.HTML
+            every { item.time() } returns ZonedDateTime.now()
+            every { item.contains(any<Pattern>()) } returns false
+            every { item.contains(any<String>(), any()) } returns false
+            return item
+        }
+
+        private fun jsonOf(text: String) = Json.parseToJsonElement(text).jsonObject
+
+        private fun itemsOf(envelope: kotlinx.serialization.json.JsonObject) =
+            envelope.getValue("items").jsonArray.map { it.jsonObject }
+
         @Test
         fun `get proxy history should paginate properly`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
+                historyItem("GET /item1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", "Item 1 notes"),
+                historyItem("GET /item2 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", "Item 2 notes"),
+                historyItem("GET /item3 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", "Item 3 notes")
             )
-            
+
             every { api.proxy() } returns proxy
             every { proxy.history() } returns proxyHistory
-            
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item1 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 1 notes"
-            )
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item2 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 2 notes"
-            )
-            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item3 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 3 notes"
-            )
-            
+
             runBlocking {
-                val result1 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 0
-                    )
-                )
-                
-                delay(100)
-                val text1 = result1.expectTextContent()
+                val text1 = client.callTool(
+                    "get_proxy_http_history", mapOf("count" to 2, "offset" to 0)
+                ).expectTextContent()
                 assertTrue(text1.contains("GET /item1"))
                 assertTrue(text1.contains("GET /item2"))
                 assertFalse(text1.contains("GET /item3"))
-                
-                val result2 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 2
-                    )
-                )
-                
-                delay(100)
-                val text2 = result2.expectTextContent()
+
+                val text2 = client.callTool(
+                    "get_proxy_http_history", mapOf("count" to 2, "offset" to 2)
+                ).expectTextContent()
                 assertTrue(text2.contains("GET /item3"))
-                
+
                 val result3 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 3
-                    )
+                    "get_proxy_http_history", mapOf("count" to 2, "offset" to 3)
                 )
-                
-                delay(100)
                 assertEquals("Reached end of items", result3.expectTextContent())
+            }
+        }
+
+        @Test
+        fun `get proxy history items carry global index id and metadata`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                historyItem("GET /first HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n", "HTTP/1.1 201 Created"),
+                historyItem("POST /second HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n", "HTTP/1.1 404 Not Found")
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history",
+                    mapOf("count" to 2, "offset" to 1, "fields" to listOf("method", "host", "port", "path", "statusCode"))
+                ).expectTextContent()
+
+                val second = jsonOf(text)
+                assertEquals(2, second.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals(2, second.getValue("id").jsonPrimitive.content.toInt())
+                assertEquals("POST", second.getValue("method").jsonPrimitive.content)
+                assertEquals("api.localhost", second.getValue("host").jsonPrimitive.content)
+                assertEquals(18080, second.getValue("port").jsonPrimitive.content.toInt())
+                assertEquals("/second", second.getValue("path").jsonPrimitive.content)
+                assertEquals(404, second.getValue("statusCode").jsonPrimitive.content.toInt())
+                assertFalse(second.containsKey("request"))
+            }
+        }
+
+        @Test
+        fun `get proxy history newest first keeps global indices`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                historyItem("GET /oldest HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /middle HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /newest HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history",
+                    mapOf("count" to 3, "offset" to 0, "newestFirst" to true, "fields" to listOf("path"))
+                ).expectTextContent()
+
+                // The page is a "\n\n" separated list of JSON documents.
+                val order = text.split("\n\n").map { jsonOf(it).getValue("index").jsonPrimitive.content.toInt() }
+                assertEquals(listOf(3, 2, 1), order)
+            }
+        }
+
+        @Test
+        fun `get proxy history should return valid size limited JSON`() {
+            val proxy = mockk<Proxy>()
+            val item = historyItem(
+                "GET / HTTP/1.1\r\nHost: example.test\r\n\r\nX-Long: ${"\\\"😀".repeat(2_000)}",
+                "HTTP/1.1 200 OK\r\n\r\n${"😀".repeat(3_000)}",
+                notes = "keep me"
+            )
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history",
+                    mapOf("count" to 1, "offset" to 0, "fields" to listOf("request", "response", "notes"))
+                ).expectTextContent()
+                val json = jsonOf(text)
+
+                assertTrue(text.length <= 5_000)
+                assertEquals(setOf("index", "id", "request", "response", "notes"), json.keys)
+                assertTrue(json.getValue("request").jsonPrimitive.content.endsWith("... (truncated)"))
+                assertTrue(json.getValue("response").jsonPrimitive.content.endsWith("... (truncated)"))
+                assertEquals("keep me", json.getValue("notes").jsonPrimitive.content)
             }
         }
 
@@ -764,64 +962,64 @@ class ToolsKtTest {
         fun `get latest proxy http history should return newest item without knowing offset`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
+                historyItem("GET /oldest HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /middle HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /newest HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
             )
 
             every { api.proxy() } returns proxy
             every { proxy.history() } returns proxyHistory
 
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /oldest HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = null
-            )
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /middle HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = null
-            )
-            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /newest HTTP/1.1\r\nHost: example.com\r\n\r\nbody",
-                response = "HTTP/1.1 201 Created",
-                notes = "new"
-            )
-
             runBlocking {
-                val result = client.callTool(
-                    "get_latest_proxy_http_history", mapOf(
-                        "count" to 1
-                    )
-                )
+                val text = client.callTool(
+                    "get_latest_proxy_http_history", mapOf("count" to 1, "fields" to listOf("path"))
+                ).expectTextContent()
+                val json = jsonOf(text)
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("POST /newest"), "Latest item should be returned")
-                assertTrue(text.contains("\"index\":3"), "Latest item should include 1-based history index")
-                assertFalse(text.contains("GET /middle"), "Older item should not be returned")
-                assertFalse(text.contains("GET /oldest"), "Oldest item should not be returned")
+                assertEquals(3, json.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals("/newest", json.getValue("path").jsonPrimitive.content)
             }
         }
 
         @Test
         fun `get proxy http history count should return total count`() {
             val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
-            )
-
             every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
+            every { proxy.history() } returns List(5) {
+                historyItem("GET /item$it HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            }
 
             runBlocking {
-                val result = client.callTool("get_proxy_http_history_count", emptyMap())
-                delay(100)
-                result.expectTextContent("3")
+                val text = client.callTool("get_proxy_http_history_count", mapOf()).expectTextContent()
+                assertEquals("5", text)
+            }
+        }
+
+        @Test
+        fun `get proxy http history count should count regex matches natively`() {
+            val proxy = mockk<Proxy>()
+            val items = List(4) {
+                historyItem("GET /item$it HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            }
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns items
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(items[1], items[3])
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_count", mapOf("regex" to "banking")
+                ).expectTextContent()
+                assertEquals("2", text)
+            }
+        }
+
+        @Test
+        fun `get proxy http history count should reject an invalid regex`() {
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_count", mapOf("regex" to "(")
+                ).expectTextContent()
+                assertTrue(text.startsWith("Invalid regex: "))
             }
         }
 
@@ -829,143 +1027,196 @@ class ToolsKtTest {
         fun `get proxy http history by index should return the selected one based item`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
+                historyItem("GET /item1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", "notes 1"),
+                historyItem("GET /item2 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", "notes 2")
             )
 
             every { api.proxy() } returns proxy
             every { proxy.history() } returns proxyHistory
 
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /first HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = null
-            )
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /second HTTP/1.1",
-                response = "HTTP/1.1 404 Not Found",
-                notes = "selected"
-            )
-
             runBlocking {
-                val result = client.callTool(
-                    "get_proxy_http_history_by_index", mapOf(
-                        "index" to 2
-                    )
-                )
+                val text = client.callTool(
+                    "get_proxy_http_history_by_index", mapOf("index" to 2, "fields" to listOf("path", "notes"))
+                ).expectTextContent()
+                val json = jsonOf(text)
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("GET /second"), "Requested item should be returned")
-                assertTrue(text.contains("\"index\":2"), "Response should include selected index")
-                assertFalse(text.contains("GET /first"), "Other items should not be returned")
+                assertEquals(2, json.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals("/item2", json.getValue("path").jsonPrimitive.content)
+                assertEquals("notes 2", json.getValue("notes").jsonPrimitive.content)
             }
         }
 
         @Test
-        fun `get latest proxy http history should support compact field selection`() {
+        fun `get proxy http history by index should report a missing index`() {
             val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
-
             every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
-
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /login HTTP/1.1\r\nHost: example.com\r\n\r\nsecret=body",
-                response = "HTTP/1.1 302 Found\r\nLocation: /home\r\n\r\nlarge response body",
-                notes = "interesting"
-            )
+            every { proxy.history() } returns emptyList()
 
             runBlocking {
-                val result = client.callTool(
-                    "get_latest_proxy_http_history", mapOf(
-                        "count" to 1,
-                        "fields" to listOf("requestLine", "responseLine", "notes")
-                    )
-                )
-
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("POST /login HTTP/1.1"), "Request line should be returned")
-                assertTrue(text.contains("HTTP/1.1 302 Found"), "Response line should be returned")
-                assertTrue(text.contains("interesting"), "Selected notes field should be returned")
-                assertFalse(text.contains("secret=body"), "Full request body should not be returned")
-                assertFalse(text.contains("large response body"), "Full response body should not be returned")
+                val text = client.callTool(
+                    "get_proxy_http_history_by_index", mapOf("index" to 4)
+                ).expectTextContent()
+                assertEquals("No HTTP history found at 4", text)
             }
         }
 
         @Test
-        fun `get proxy http history since should return entries after a known index`() {
+        fun `get proxy http history regex should report global indices that by index resolves to the same item`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
+                historyItem("GET /plain1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /needle HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /plain2 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            )
+            every { proxyHistory[1].contains(any<Pattern>()) } returns true
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(proxyHistory[1])
+
+            runBlocking {
+                val regexText = client.callTool(
+                    "get_proxy_http_history_regex",
+                    mapOf("regex" to "needle", "count" to 10, "offset" to 0, "fields" to listOf("path"))
+                ).expectTextContent()
+                val regexItem = jsonOf(regexText)
+
+                assertEquals(2, regexItem.getValue("index").jsonPrimitive.content.toInt())
+                assertEquals("/needle", regexItem.getValue("path").jsonPrimitive.content)
+
+                val byIndexText = client.callTool(
+                    "get_proxy_http_history_by_index",
+                    mapOf("index" to regexItem.getValue("index").jsonPrimitive.content.toInt(), "fields" to listOf("path"))
+                ).expectTextContent()
+
+                assertEquals("/needle", jsonOf(byIndexText).getValue("path").jsonPrimitive.content)
+            }
+        }
+
+        @Test
+        fun `get proxy http history regex should fall back to a positional scan when ids collide`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                historyItem("GET /plain1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /needle HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            )
+            // Every item reports the same id, so identity mapping cannot be used.
+            every { proxyHistory[0].id() } returns 7
+            every { proxyHistory[1].id() } returns 7
+            every { proxyHistory[1].contains(any<Pattern>()) } returns true
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+            every { proxy.history(any<ProxyHistoryFilter>()) } returns listOf(proxyHistory[1])
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_regex",
+                    mapOf("regex" to "needle", "count" to 10, "offset" to 0, "fields" to listOf("path"))
+                ).expectTextContent()
+
+                assertEquals(2, jsonOf(text).getValue("index").jsonPrimitive.content.toInt())
+            }
+        }
+
+        @Test
+        fun `get proxy http history since should return entries after a known index and report the history size`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                historyItem("GET /item1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /item2 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK"),
+                historyItem("GET /item3 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
             )
 
             every { api.proxy() } returns proxy
             every { proxy.history() } returns proxyHistory
 
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /after-two HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = null
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_since",
+                    mapOf("afterIndex" to 1, "count" to 10, "fields" to listOf("path"))
+                ).expectTextContent()
+                val envelope = jsonOf(text)
+
+                assertEquals(3, envelope.getValue("historySize").jsonPrimitive.content.toInt())
+                assertEquals(2, envelope.getValue("returned").jsonPrimitive.content.toInt())
+                assertEquals(3, envelope.getValue("nextIndex").jsonPrimitive.content.toInt())
+                assertEquals(false, envelope.getValue("hasMore").jsonPrimitive.content.toBoolean())
+                assertEquals(
+                    listOf("/item2", "/item3"),
+                    itemsOf(envelope).map { it.getValue("path").jsonPrimitive.content }
+                )
+            }
+        }
+
+        @Test
+        fun `get proxy http history since should flag a reset history`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = listOf(
+                historyItem("GET /item1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
             )
-            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /after-three HTTP/1.1",
-                response = "HTTP/1.1 201 Created",
-                notes = null
-            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
 
             runBlocking {
-                val result = client.callTool(
-                    "get_proxy_http_history_since", mapOf(
-                        "afterIndex" to 1,
-                        "count" to 2,
-                        "fields" to listOf("requestLine")
-                    )
-                )
+                val text = client.callTool(
+                    "get_proxy_http_history_since", mapOf("afterIndex" to 900)
+                ).expectTextContent()
+                val envelope = jsonOf(text)
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("\"index\":2"))
-                assertTrue(text.contains("\"index\":3"))
-                assertTrue(text.contains("GET /after-two HTTP/1.1"))
-                assertTrue(text.contains("GET /after-three HTTP/1.1"))
+                assertEquals(1, envelope.getValue("historySize").jsonPrimitive.content.toInt())
+                assertEquals(0, envelope.getValue("returned").jsonPrimitive.content.toInt())
+                assertEquals(true, envelope.getValue("historyReset").jsonPrimitive.content.toBoolean())
             }
         }
 
         @Test
         fun `get proxy http history body should return a bounded request slice`() {
             val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
-
+            val requestText = "POST /submit HTTP/1.1\r\nHost: example.test\r\n\r\nabcdefghij"
             every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
-
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /slice HTTP/1.1\r\nHost: example.com\r\n\r\nabcdef0123456789",
-                response = "HTTP/1.1 200 OK\r\n\r\nresponse-body",
-                notes = null
-            )
+            every { proxy.history() } returns listOf(historyItem(requestText, "HTTP/1.1 200 OK\r\n\r\nresponse"))
 
             runBlocking {
-                val result = client.callTool(
-                    "get_proxy_http_history_body", mapOf(
-                        "index" to 1,
-                        "message" to "request",
-                        "offset" to 4,
-                        "length" to 6
-                    )
-                )
+                val text = client.callTool(
+                    "get_proxy_http_history_body",
+                    mapOf("index" to 1, "message" to "request", "offset" to 2, "length" to 4)
+                ).expectTextContent()
 
-                delay(100)
-                result.expectTextContent("ef0123")
+                assertEquals("cdef", text)
+            }
+        }
+
+        @Test
+        fun `get proxy http history body should reject an oversized length`() {
+            val proxy = mockk<Proxy>()
+            every { api.proxy() } returns proxy
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_body",
+                    mapOf("index" to 1, "message" to "request", "offset" to 0, "length" to 500_000)
+                ).expectTextContent()
+
+                assertTrue(text.contains("length must not exceed"))
+            }
+        }
+
+        @Test
+        fun `get proxy http history message slice should return headers slice`() {
+            val proxy = mockk<Proxy>()
+            val responseText = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nbody"
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(historyItem("GET /page HTTP/1.1\r\nHost: example.test\r\n\r\n", responseText))
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_message_slice",
+                    mapOf("index" to 1, "message" to "response", "part" to "headers", "offset" to 0, "length" to 5000)
+                ).expectTextContent()
+
+                assertEquals("HTTP/1.1 200 OK\r\nContent-Type: text/html", text)
             }
         }
 
@@ -973,348 +1224,436 @@ class ToolsKtTest {
         fun `create repeater tab from history should reuse selected request`() {
             val proxy = mockk<Proxy>()
             val repeater = mockk<burp.api.montoya.repeater.Repeater>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
-            val request = mockk<HttpRequest>()
-
+            every { repeater.sendToRepeater(any<HttpRequest>(), any<String>()) } just runs
+            val request = requestMock("GET /reuse HTTP/1.1\r\nHost: example.test\r\n\r\n")
             every { api.proxy() } returns proxy
             every { api.repeater() } returns repeater
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.request() } returns request
-            every { repeater.sendToRepeater(any(), any()) } returns mockk(relaxed = true)
+            every { proxy.history() } returns listOf(historyItem("GET /reuse HTTP/1.1\r\nHost: example.test\r\n\r\n", request = request))
 
             runBlocking {
-                val result = client.callTool(
-                    "create_repeater_tab_from_history", mapOf(
-                        "index" to 1,
-                        "tabName" to "latest-login"
-                    )
-                )
+                val text = client.callTool(
+                    "create_repeater_tab_from_history", mapOf("index" to 1, "tabName" to "from history")
+                ).expectTextContent()
 
-                delay(100)
-                result.expectTextContent("Created Repeater tab from HTTP history index 1")
+                assertEquals("Created Repeater tab from HTTP history index 1", text)
             }
 
-            verify(exactly = 1) { repeater.sendToRepeater(request, "latest-login") }
+            verify(exactly = 1) { repeater.sendToRepeater(request, "from history") }
         }
 
         @Test
         fun `send to intruder from history should reuse selected request`() {
             val proxy = mockk<Proxy>()
             val intruder = mockk<burp.api.montoya.intruder.Intruder>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
-            val request = mockk<HttpRequest>()
-
+            every { intruder.sendToIntruder(any<HttpRequest>(), any<String>()) } just runs
+            val request = requestMock("GET /fuzz HTTP/1.1\r\nHost: example.test\r\n\r\n")
             every { api.proxy() } returns proxy
             every { api.intruder() } returns intruder
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.request() } returns request
-            every { intruder.sendToIntruder(any<HttpRequest>(), any<String>()) } just runs
+            every { proxy.history() } returns listOf(historyItem("GET /fuzz HTTP/1.1\r\nHost: example.test\r\n\r\n", request = request))
 
             runBlocking {
-                val result = client.callTool(
-                    "send_to_intruder_from_history", mapOf(
-                        "index" to 1,
-                        "tabName" to "latest-login"
-                    )
-                )
+                val text = client.callTool(
+                    "send_to_intruder_from_history", mapOf("index" to 1, "tabName" to "fuzz")
+                ).expectTextContent()
 
-                delay(100)
-                result.expectTextContent("Sent HTTP history index 1 to Intruder")
+                assertEquals("Sent HTTP history index 1 to Intruder", text)
             }
 
-            verify(exactly = 1) { intruder.sendToIntruder(request, "latest-login") }
-        }
-
-        @Test
-        fun `get latest proxy http history should expose computed metadata fields`() {
-            val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
-
-            every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
-
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /api/users?id=1 HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\n\r\n{\"name\":\"david\"}",
-                response = "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}",
-                notes = null
-            )
-
-            runBlocking {
-                val result = client.callTool(
-                    "get_latest_proxy_http_history", mapOf(
-                        "count" to 1,
-                        "fields" to listOf("method", "path", "host", "statusCode", "contentType", "requestContentLength", "responseContentLength", "hasRequestBody", "hasResponseBody")
-                    )
-                )
-
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("\"method\":\"POST\""))
-                assertTrue(text.contains("\"path\":\"/api/users?id=1\""))
-                assertTrue(text.contains("\"host\":\"api.example.com\""))
-                assertTrue(text.contains("\"statusCode\":201"))
-                assertTrue(text.contains("\"contentType\":\"application/json\""))
-                assertTrue(text.contains("\"requestContentLength\":16"))
-                assertTrue(text.contains("\"responseContentLength\":11"))
-                assertTrue(text.contains("\"hasRequestBody\":true"))
-                assertTrue(text.contains("\"hasResponseBody\":true"))
-                assertFalse(text.contains("david"), "Full body should not be included for metadata-only fields")
-            }
+            verify(exactly = 1) { intruder.sendToIntruder(request, "fuzz") }
         }
 
         @Test
         fun `get proxy http history filtered should filter by method path status and content type`() {
             val proxy = mockk<Proxy>()
             val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
+                historyItem(
+                    "GET /public/index.html HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<body>"
+                ),
+                historyItem(
+                    "POST /api/orders HTTP/1.1\r\nHost: api.example.test\r\nContent-Type: application/json\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}"
+                ),
+                historyItem(
+                    "POST /api/orders/9 HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nboom"
+                )
             )
 
             every { api.proxy() } returns proxy
             every { proxy.history() } returns proxyHistory
 
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /api/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
-                response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
-                notes = null
-            )
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\n\r\n{\"name\":\"david\"}",
-                response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":true}",
-                notes = "candidate"
-            )
-            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /static/upload HTTP/1.1\r\nHost: cdn.example.com\r\nContent-Type: multipart/form-data\r\n\r\nfile=data",
-                response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nok",
-                notes = null
-            )
-
             runBlocking {
-                val result = client.callTool(
-                    "get_proxy_http_history_filtered", mapOf(
+                val text = client.callTool(
+                    "get_proxy_http_history_filtered",
+                    mapOf(
                         "method" to "POST",
-                        "host" to "api.example.com",
-                        "pathContains" to "/api/",
-                        "statusCode" to 500,
-                        "hasRequestBody" to true,
+                        "host" to "api.example.test",
+                        "pathContains" to "/api/orders",
+                        "statusCode" to 200,
                         "contentTypeContains" to "json",
-                        "count" to 10,
-                        "fields" to listOf("method", "path", "host", "statusCode", "notes")
+                        "fields" to listOf("path")
                     )
-                )
+                ).expectTextContent()
+                val envelope = jsonOf(text)
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("\"index\":2"))
-                assertTrue(text.contains("\"method\":\"POST\""))
-                assertTrue(text.contains("\"path\":\"/api/users\""))
-                assertTrue(text.contains("candidate"))
-                assertFalse(text.contains("\"index\":1"))
-                assertFalse(text.contains("\"index\":3"))
+                assertEquals(1, envelope.getValue("totalMatches").jsonPrimitive.content.toInt())
+                assertEquals(listOf("/api/orders"), itemsOf(envelope).map { it.getValue("path").jsonPrimitive.content })
             }
         }
 
         @Test
-        fun `get proxy http history message slice should return headers slice`() {
+        fun `get proxy http history filtered should match the host with or without a port`() {
             val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(mockk<ProxyHttpRequestResponse>())
-
             every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
-
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "POST /slice HTTP/1.1\r\nHost: example.com\r\nX-Test: abc\r\n\r\nrequest-body",
-                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nresponse-body",
-                notes = null
+            every { proxy.history() } returns listOf(
+                historyItem("GET /one HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n", "HTTP/1.1 200 OK")
             )
 
             runBlocking {
-                val result = client.callTool(
-                    "get_proxy_http_history_message_slice", mapOf(
-                        "index" to 1,
-                        "message" to "request",
-                        "part" to "headers",
-                        "offset" to 0,
-                        "length" to 200
-                    )
+                val withoutPort = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf("host" to "api.localhost", "fields" to listOf("path"))
+                    ).expectTextContent()
                 )
+                assertEquals(1, withoutPort.getValue("totalMatches").jsonPrimitive.content.toInt())
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("Host: example.com"))
-                assertTrue(text.contains("X-Test: abc"))
-                assertFalse(text.contains("request-body"))
+                val withPort = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf("host" to "api.localhost:18080", "fields" to listOf("path"))
+                    ).expectTextContent()
+                )
+                assertEquals(1, withPort.getValue("totalMatches").jsonPrimitive.content.toInt())
+
+                val wrongPort = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf("host" to "api.localhost:9999", "fields" to listOf("path"))
+                    ).expectTextContent()
+                )
+                assertEquals(0, wrongPort.getValue("totalMatches").jsonPrimitive.content.toInt())
             }
+        }
+
+        @Test
+        fun `get proxy http history filtered should page with offset and report totals`() {
+            val proxy = mockk<Proxy>()
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns (1..5).map {
+                historyItem("GET /page$it HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 403 Forbidden")
+            }
+
+            runBlocking {
+                val firstPage = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf("statusCode" to 403, "count" to 2, "offset" to 0, "fields" to listOf("path"))
+                    ).expectTextContent()
+                )
+                assertEquals(5, firstPage.getValue("totalMatches").jsonPrimitive.content.toInt())
+                assertEquals(2, firstPage.getValue("returned").jsonPrimitive.content.toInt())
+                assertEquals(true, firstPage.getValue("hasMore").jsonPrimitive.content.toBoolean())
+                assertEquals(listOf("/page1", "/page2"), itemsOf(firstPage).map { it.getValue("path").jsonPrimitive.content })
+
+                val lastPage = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf("statusCode" to 403, "count" to 2, "offset" to 4, "fields" to listOf("path"))
+                    ).expectTextContent()
+                )
+                assertEquals(1, lastPage.getValue("returned").jsonPrimitive.content.toInt())
+                assertEquals(false, lastPage.getValue("hasMore").jsonPrimitive.content.toBoolean())
+                assertEquals(listOf("/page5"), itemsOf(lastPage).map { it.getValue("path").jsonPrimitive.content })
+            }
+        }
+
+        @Test
+        fun `get proxy http history filtered should distinguish zero matches from end of page`() {
+            val proxy = mockk<Proxy>()
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(
+                historyItem("GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            )
+
+            runBlocking {
+                val text = client.callTool(
+                    "get_proxy_http_history_filtered", mapOf("statusCode" to 599)
+                ).expectTextContent()
+                val envelope = jsonOf(text)
+
+                assertFalse(text.contains("Reached end of items"))
+                assertEquals(0, envelope.getValue("totalMatches").jsonPrimitive.content.toInt())
+                assertEquals(0, envelope.getValue("returned").jsonPrimitive.content.toInt())
+                assertEquals(true, envelope.getValue("items").jsonArray.isEmpty())
+            }
+        }
+
+        @Test
+        fun `get proxy http history filtered should not materialise message text for metadata filters`() {
+            val proxy = mockk<Proxy>()
+            val request = requestMock("GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n")
+            val response = responseMock("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(
+                historyItem(
+                    "GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}",
+                    request = request,
+                    response = response
+                )
+            )
+
+            runBlocking {
+                val envelope = jsonOf(
+                    client.callTool(
+                        "get_proxy_http_history_filtered",
+                        mapOf(
+                            "method" to "GET",
+                            "statusCode" to 200,
+                            "contentTypeContains" to "json",
+                            "fields" to listOf("method", "statusCode")
+                        )
+                    ).expectTextContent()
+                )
+                assertEquals(1, envelope.getValue("totalMatches").jsonPrimitive.content.toInt())
+            }
+
+            verify(exactly = 0) { request.toString() }
+            verify(exactly = 0) { response.toString() }
+            verify(exactly = 0) { request.body() }
+            verify(exactly = 0) { response.body() }
         }
 
         @Test
         fun `send http request from history should replay mutated request`() {
             val proxy = mockk<Proxy>()
             val http = mockk<Http>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
-            val originalRequest = mockk<HttpRequest>()
-            val pathMutatedRequest = mockk<HttpRequest>()
-            val bodyMutatedRequest = mockk<HttpRequest>()
-            val headerMutatedRequest = mockk<HttpRequest>()
-            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
-
+            val mutatedPath = StringBuilder()
+            val request = requestMock("GET /original HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            every { request.withPath(any()) } answers {
+                mutatedPath.append(firstArg<String>())
+                request
+            }
             every { api.proxy() } returns proxy
             every { api.http() } returns http
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.request() } returns originalRequest
-            every { originalRequest.toString() } returns "POST /old HTTP/1.1\r\nHost: example.com\r\n\r\nold=1"
-            every { originalRequest.withPath("/new") } returns pathMutatedRequest
-            every { pathMutatedRequest.withBody("new=2") } returns bodyMutatedRequest
-            every { bodyMutatedRequest.withUpdatedHeader("X-Test", "yes") } returns headerMutatedRequest
-            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\n\r\nreplayed"
-            every { http.sendRequest(headerMutatedRequest) } returns httpResponse
+            every { proxy.history() } returns listOf(historyItem("GET /original HTTP/1.1\r\nHost: example.test\r\n\r\n", request = request))
+            every { http.sendRequest(any()) } returns sendResultMock("HTTP/1.1 200 OK\r\n\r\nreplayed")
 
             runBlocking {
-                val result = client.callTool(
-                    "send_http_request_from_history", mapOf(
-                        "index" to 1,
-                        "replacePath" to "/new",
-                        "replaceBody" to "new=2",
-                        "replaceHeaders" to mapOf("X-Test" to "yes")
-                    )
-                )
+                val text = client.callTool(
+                    "send_http_request_from_history", mapOf("index" to 1, "replacePath" to "/mutated")
+                ).expectTextContent()
 
-                delay(100)
-                result.expectTextContent("HTTP/1.1 200 OK\r\n\r\nreplayed")
+                assertEquals("HTTP/1.1 200 OK\r\n\r\nreplayed", text)
+                assertEquals("/mutated", mutatedPath.toString())
             }
 
-            verify(exactly = 1) { http.sendRequest(headerMutatedRequest) }
+            verify(exactly = 1) { http.sendRequest(request) }
+        }
+
+        @Test
+        fun `send http request from history should add a header that the request is missing`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val request = requestMock("GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n")
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(historyItem("GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n", request = request))
+            every { http.sendRequest(any()) } returns sendResultMock("HTTP/1.1 200 OK\r\n\r\n{}")
+
+            runBlocking {
+                client.callTool(
+                    "send_http_request_from_history",
+                    mapOf("index" to 1, "replaceHeaders" to mapOf("Authorization" to "Bearer token"))
+                ).expectTextContent()
+            }
+
+            verify(exactly = 1) { request.withAddedHeader("Authorization", "Bearer token") }
+            verify(exactly = 0) { request.withUpdatedHeader(any(), any()) }
+        }
+
+        @Test
+        fun `send http request from history should update a header that already exists`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val request = requestMock("GET /page HTTP/1.1\r\nHost: example.test\r\nUser-Agent: old\r\n\r\n")
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(
+                historyItem("GET /page HTTP/1.1\r\nHost: example.test\r\nUser-Agent: old\r\n\r\n", request = request)
+            )
+            every { http.sendRequest(any()) } returns sendResultMock("HTTP/1.1 200 OK\r\n\r\nok")
+
+            runBlocking {
+                client.callTool(
+                    "send_http_request_from_history",
+                    mapOf("index" to 1, "replaceHeaders" to mapOf("User-Agent" to "new"))
+                ).expectTextContent()
+            }
+
+            verify(exactly = 1) { request.withUpdatedHeader("User-Agent", "new") }
+            verify(exactly = 0) { request.withAddedHeader(any(), any()) }
+        }
+
+        @Test
+        fun `send http request from history should pass through the request approval gate`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val request = requestMock("GET /internal HTTP/1.1\r\nHost: internal.test\r\n\r\n")
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(historyItem("GET /internal HTTP/1.1\r\nHost: internal.test\r\n\r\n", request = request))
+            every { persistedConfig.getBoolean("requireHttpRequestApproval") } returns true
+
+            val originalHandler = HttpRequestSecurity.approvalHandler
+            var prompted: Pair<String, Int>? = null
+            HttpRequestSecurity.approvalHandler = object : UserApprovalHandler {
+                override suspend fun requestApproval(
+                    hostname: String,
+                    port: Int,
+                    config: McpConfig,
+                    requestContent: String?,
+                    api: MontoyaApi?
+                ): Boolean {
+                    prompted = hostname to port
+                    return false
+                }
+            }
+
+            try {
+                runBlocking {
+                    val text = client.callTool(
+                        "send_http_request_from_history", mapOf("index" to 1)
+                    ).expectTextContent()
+
+                    assertEquals("Send HTTP request denied by Burp Suite", text)
+                }
+
+                assertEquals("internal.test" to 80, prompted)
+                verify(exactly = 0) { http.sendRequest(any()) }
+            } finally {
+                HttpRequestSecurity.approvalHandler = originalHandler
+            }
         }
 
         @Test
         fun `send http request from history with diff should return baseline mutated fingerprints and delta`() {
             val proxy = mockk<Proxy>()
             val http = mockk<Http>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
-            val originalRequest = mockk<HttpRequest>()
-            val mutatedRequest = mockk<HttpRequest>()
-            val httpResponse = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
-
+            val request = requestMock("GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n")
             every { api.proxy() } returns proxy
             every { api.http() } returns http
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.request() } returns originalRequest
-            every { originalRequest.toString() } returns "GET /api/users/123 HTTP/1.1\r\nHost: example.com\r\n\r\n"
-            every { originalRequest.withPath("/api/users/124") } returns mutatedRequest
-            every { httpResponse.toString() } returns "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-New: yes\r\n\r\n{\"id\":124,\"name\":\"alice-updated\"}"
-            every { http.sendRequest(mutatedRequest) } returns httpResponse
-
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            every { historyItem.toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /api/users/123 HTTP/1.1\r\nHost: example.com\r\n\r\n",
-                response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":123,\"name\":\"alice\"}",
-                notes = null
+            every { proxy.history() } returns listOf(
+                historyItem(
+                    "GET /api/v1/users/1 HTTP/1.1\r\nHost: api.localhost:18080\r\n\r\n",
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"error\":\"unauthorized\"}",
+                    request = request
+                )
+            )
+            every { http.sendRequest(any()) } returns sendResultMock(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":1,\"name\":\"admin\"}"
             )
 
             runBlocking {
-                val result = client.callTool(
-                    "send_http_request_from_history_with_diff", mapOf(
-                        "index" to 1,
-                        "replacePath" to "/api/users/124",
-                        "bodyPreviewLength" to 200
-                    )
-                )
+                val text = client.callTool(
+                    "send_http_request_from_history_with_diff",
+                    mapOf("index" to 1, "replaceHeaders" to mapOf("Authorization" to "Bearer token"), "bodyPreviewLength" to 40)
+                ).expectTextContent()
+                val json = jsonOf(text)
 
-                delay(100)
-                val text = result.expectTextContent()
-                assertTrue(text.contains("\"baseline\""))
-                assertTrue(text.contains("\"mutated\""))
-                assertTrue(text.contains("\"delta\""))
-                assertTrue(text.contains("\"statusCode\":200"))
-                assertTrue(text.contains("\"bodyHashChanged\":true"))
-                assertTrue(text.contains("\"bodyLengthDelta\":8"))
-                assertTrue(text.contains("\"headerNamesAdded\":[\"X-New\"]"))
-                assertTrue(text.contains("\"firstDifference\""))
-                assertTrue(text.contains("123"))
-                assertTrue(text.contains("124"))
+                assertEquals(401, json.getValue("baseline").jsonObject.getValue("statusCode").jsonPrimitive.content.toInt())
+                assertEquals(200, json.getValue("mutated").jsonObject.getValue("statusCode").jsonPrimitive.content.toInt())
+                val delta = json.getValue("delta").jsonObject
+                assertEquals(true, delta.getValue("statusChanged").jsonPrimitive.content.toBoolean())
+                assertTrue(delta.getValue("similarity").jsonPrimitive.content.toDouble() < 1.0)
+                assertTrue(json.getValue("preview").jsonObject.containsKey("firstDifference"))
             }
+        }
 
-            verify(exactly = 1) { http.sendRequest(mutatedRequest) }
+        @Test
+        fun `replay responses should be truncated with the original length`() {
+            val proxy = mockk<Proxy>()
+            val http = mockk<Http>()
+            val request = requestMock("GET /big HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            every { api.proxy() } returns proxy
+            every { api.http() } returns http
+            every { proxy.history() } returns listOf(historyItem("GET /big HTTP/1.1\r\nHost: example.test\r\n\r\n", request = request))
+            every { http.sendRequest(any()) } returns sendResultMock("HTTP/1.1 200 OK\r\n\r\n" + "x".repeat(MAX_RESPONSE_TEXT_LENGTH + 10))
+
+            runBlocking {
+                val text = client.callTool(
+                    "send_http_request_from_history", mapOf("index" to 1)
+                ).expectTextContent()
+
+                assertTrue(text.contains("... (truncated: response was ${MAX_RESPONSE_TEXT_LENGTH + 29} characters)"))
+                assertTrue(text.length < MAX_RESPONSE_TEXT_LENGTH + 120)
+            }
         }
 
         @Test
         fun `set proxy http history note should update annotations`() {
             val proxy = mockk<Proxy>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
             val annotations = mockk<Annotations>()
-
-            every { api.proxy() } returns proxy
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.annotations() } returns annotations
+            val item = historyItem("GET /note HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            every { item.annotations() } returns annotations
             every { annotations.setNotes(any()) } just runs
 
-            runBlocking {
-                val result = client.callTool(
-                    "set_proxy_http_history_note", mapOf(
-                        "index" to 1,
-                        "note" to "MCP candidate: possible IDOR"
-                    )
-                )
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
 
-                delay(100)
-                result.expectTextContent("Set note on HTTP history index 1")
+            runBlocking {
+                val text = client.callTool(
+                    "set_proxy_http_history_note", mapOf("index" to 1, "note" to "checked")
+                ).expectTextContent()
+
+                assertEquals("Set note on HTTP history index 1", text)
             }
 
-            verify(exactly = 1) { annotations.setNotes("MCP candidate: possible IDOR") }
+            verify(exactly = 1) { annotations.setNotes("checked") }
         }
 
         @Test
         fun `append proxy http history note should preserve existing notes`() {
             val proxy = mockk<Proxy>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
             val annotations = mockk<Annotations>()
-
-            every { api.proxy() } returns proxy
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.annotations() } returns annotations
-            every { annotations.notes() } returns "Existing note"
+            val item = historyItem("GET /note HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK", notes = "existing")
+            every { item.annotations() } returns annotations
+            every { annotations.notes() } returns "existing"
             every { annotations.setNotes(any()) } just runs
 
-            runBlocking {
-                val result = client.callTool(
-                    "append_proxy_http_history_note", mapOf(
-                        "index" to 1,
-                        "note" to "MCP delta: 200 with similar JSON"
-                    )
-                )
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
 
-                delay(100)
-                result.expectTextContent("Appended note on HTTP history index 1")
+            runBlocking {
+                val text = client.callTool(
+                    "append_proxy_http_history_note", mapOf("index" to 1, "note" to "appended")
+                ).expectTextContent()
+
+                assertEquals("Appended note on HTTP history index 1", text)
             }
 
-            verify(exactly = 1) { annotations.setNotes("Existing note\nMCP delta: 200 with similar JSON") }
+            verify(exactly = 1) { annotations.setNotes("existing\nappended") }
         }
 
         @Test
         fun `set proxy http history highlight should update highlight color`() {
             val proxy = mockk<Proxy>()
-            val historyItem = mockk<ProxyHttpRequestResponse>()
             val annotations = mockk<Annotations>()
-
-            every { api.proxy() } returns proxy
-            every { proxy.history() } returns listOf(historyItem)
-            every { historyItem.annotations() } returns annotations
+            val item = historyItem("GET /highlight HTTP/1.1\r\nHost: example.test\r\n\r\n", "HTTP/1.1 200 OK")
+            every { item.annotations() } returns annotations
             every { annotations.setHighlightColor(any()) } just runs
 
-            runBlocking {
-                val result = client.callTool(
-                    "set_proxy_http_history_highlight", mapOf(
-                        "index" to 1,
-                        "highlight" to "red"
-                    )
-                )
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
 
-                delay(100)
-                result.expectTextContent("Set highlight red on HTTP history index 1")
+            runBlocking {
+                val text = client.callTool(
+                    "set_proxy_http_history_highlight", mapOf("index" to 1, "highlight" to "red")
+                ).expectTextContent()
+
+                assertEquals("Set highlight red on HTTP history index 1", text)
             }
 
             verify(exactly = 1) { annotations.setHighlightColor(HighlightColor.RED) }
