@@ -17,18 +17,27 @@ internal inline fun <reified T> encodeHistoryItem(item: T): String =
 internal fun limitHistoryItemJson(serialized: String): String {
     if (serialized.length <= MAX_HISTORY_ITEM_LENGTH) return serialized
 
-    val item = Json.parseToJsonElement(serialized)
+    return limitHistoryItemElement(Json.parseToJsonElement(serialized)).toString()
+}
+
+/**
+ * Same truncation as [limitHistoryItemJson], but keeps the result as a [JsonElement] so callers
+ * that embed the item into a larger document do not have to re-parse it.
+ */
+internal fun limitHistoryItemElement(item: JsonElement): JsonElement {
+    val serializedLength = Json.encodeToString(JsonElement.serializer(), item).length
+    if (serializedLength <= MAX_HISTORY_ITEM_LENGTH) return item
+
     var lowerBound = TRUNCATION_MARKER.length
-    var upperBound = serialized.length
-    var best: String? = null
+    var upperBound = serializedLength
+    var best: JsonElement? = null
 
     while (lowerBound <= upperBound) {
         val fieldLimit = (lowerBound + upperBound) / 2
-        val candidate = Json.encodeToString(
-            JsonElement.serializer(), item.truncateStringsTo(fieldLimit)
-        )
+        val candidate = item.truncateStringsTo(fieldLimit)
+        val candidateLength = Json.encodeToString(JsonElement.serializer(), candidate).length
 
-        if (candidate.length <= MAX_HISTORY_ITEM_LENGTH) {
+        if (candidateLength <= MAX_HISTORY_ITEM_LENGTH) {
             best = candidate
             lowerBound = fieldLimit + 1
         } else {
