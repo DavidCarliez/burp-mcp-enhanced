@@ -23,8 +23,8 @@ Important consequences:
 
 - New tools appear only after the updated extension JAR is loaded in Burp.
 - Tool behavior lives in the Burp extension JAR, not in the proxy JAR.
-- Proxy history indexes refer to Burp's current in-memory history.
-- If history is cleared or heavily changed, recount and rediscover indexes.
+- Proxy history indexes are global 1-based positions in Burp's current in-memory history. Every tool reports and accepts the same number.
+- If history is cleared or heavily changed, recount and rediscover indexes; `get_proxy_http_history_since` reports `historyReset` when a stored cursor no longer exists.
 
 ## First Moves on a Target
 
@@ -47,12 +47,11 @@ Use tool: `get_proxy_http_history_count`
     "method",
     "path",
     "host",
+    "port",
     "statusCode",
-    "contentType",
+    "mimeType",
     "requestContentLength",
     "responseContentLength",
-    "hasRequestBody",
-    "hasResponseBody",
     "notes"
   ]
 }
@@ -67,8 +66,9 @@ Use tool: `get_latest_proxy_http_history`
   "method": "POST",
   "hasRequestBody": true,
   "newestFirst": true,
+  "offset": 0,
   "count": 20,
-  "fields": ["method", "path", "host", "statusCode", "contentType", "requestContentLength"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType", "requestContentLength"]
 }
 ```
 
@@ -76,28 +76,36 @@ Use tool: `get_proxy_http_history_filtered`
 
 ## Index and Pagination Rules
 
-- `index` is 1-based and points to a single proxy history row.
-- `offset` is 0-based and used only by paginated list tools.
+- `index` is the global 1-based position of one proxy history row. Paginated lists, regex search, structured filtering, slices, replay, notes, highlights, Repeater and Intruder all use that same number.
+- `id` is Burp's own item id and is reported beside `index`.
+- `offset` is 0-based and only used by list tools.
+- `_filtered` returns `totalMatches`, `offset`, `returned`, `hasMore` and `items`. Zero hits means `totalMatches: 0`, not "end of items".
 - Prefer `get_latest_proxy_http_history` when you want newest items.
-- Prefer `get_proxy_http_history_since` when polling after a known index.
+- Prefer `get_proxy_http_history_since` when polling after a known index; use its `nextIndex` for the following poll.
 
-Do not mix `index` and `offset`.
+Do not mix `index` and `offset`, and never renumber regex hits by their position in the match list.
+
+## Output Limits
+
+- `count` up to 500, `length` up to 200000 characters, `bodyPreviewLength` up to 20000.
+- One history item is capped at 5000 characters of JSON; long strings end with `... (truncated)` and the document stays parseable.
+- Send and replay responses are cut at 200000 characters with the original length appended.
+- A missing request or response is JSON `null`, not a placeholder string.
 
 ## Compact Fields
 
 Use compact fields first:
 
+- `index`, `id` (always present)
 - `method`
 - `path`
 - `host`
+- `port`
 - `statusCode`
-- `contentType`
+- `mimeType`
+- `time`
 - `requestContentLength`
 - `responseContentLength`
-- `hasRequestBody`
-- `hasResponseBody`
-- `requestLine`
-- `responseLine`
 - `notes`
 
 Avoid `request` and `response` during broad scans. They can be huge.
@@ -168,6 +176,8 @@ Example body mutation:
 
 Replay rules:
 
+- Headers in `replaceHeaders` are updated when present and added when missing, so injecting `Authorization` or `Cookie` works.
+- Replay passes through the same per-target approval gate as `send_http1_request`, evaluated on the mutated request's target.
 - Make one mutation class at a time when testing hypotheses.
 - Compare status code, response length, content type, and semantic body differences.
 - Preserve authentication unless the test specifically targets auth behavior.
@@ -279,8 +289,9 @@ Tool: `send_to_intruder_from_history`
   "method": "GET",
   "pathContains": "/api/",
   "newestFirst": true,
+  "offset": 0,
   "count": 30,
-  "fields": ["method", "path", "host", "statusCode", "hasResponseBody"]
+  "fields": ["method", "path", "host", "statusCode", "responseContentLength"]
 }
 ```
 
@@ -298,8 +309,9 @@ Tool: `send_to_intruder_from_history`
   "hasRequestBody": true,
   "contentTypeContains": "json",
   "newestFirst": true,
+  "offset": 0,
   "count": 30,
-  "fields": ["method", "path", "host", "statusCode", "requestContentLength"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType", "requestContentLength"]
 }
 ```
 
@@ -315,8 +327,9 @@ Tool: `send_to_intruder_from_history`
 {
   "statusCode": 500,
   "newestFirst": true,
+  "offset": 0,
   "count": 20,
-  "fields": ["method", "path", "host", "contentType", "responseContentLength"]
+  "fields": ["method", "path", "host", "mimeType", "responseContentLength"]
 }
 ```
 
@@ -333,11 +346,11 @@ Tool: `send_to_intruder_from_history`
 {
   "afterIndex": 120,
   "count": 50,
-  "fields": ["method", "path", "host", "statusCode", "contentType"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType"]
 }
 ```
 
-4. Process only the new entries.
+4. Process only the new entries and continue from `nextIndex`.
 
 ## Safety and Scope
 
@@ -354,7 +367,7 @@ Most agents using this file should operate the MCP server, not change it. If you
 - Main tool code: `src/main/kotlin/net/portswigger/mcp/tools/Tools.kt`
 - Main tests: `src/test/kotlin/net/portswigger/mcp/tools/ToolsKtTest.kt`
 - Add failing tests first.
-- Preserve history and request security gates.
+- Preserve history and request security gates (`DataAccessSecurity`, `HttpRequestSecurity`).
 - Run `./gradlew test`.
 - Build with `./gradlew embedProxyJar`.
 - Installable JAR: `build/libs/burp-mcp-all.jar`
@@ -364,7 +377,7 @@ Most agents using this file should operate the MCP server, not change it. If you
 
 - Dumping complete history instead of compact fields.
 - Pulling full request and response bodies before selecting candidates.
-- Confusing 1-based `index` with 0-based `offset`.
+- Confusing global 1-based `index` with 0-based `offset`.
 - Assuming WebSocket tools have HTTP feature parity.
 - Replaying requests without understanding the side effect.
 - Forgetting that Burp must load the latest extension JAR before tools appear.

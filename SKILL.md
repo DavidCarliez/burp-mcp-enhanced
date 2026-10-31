@@ -104,17 +104,32 @@ When adding a tool:
 
 ## Enhanced Proxy History Model
 
-Proxy HTTP history uses **1-based indexes** for agent-facing APIs. Index `1` means the first item in Burp's current proxy history list. This is deliberate because humans and agents discuss Burp history as numbered rows.
+Proxy HTTP history uses **global 1-based indexes** for agent-facing APIs. Index `1` is the first item in Burp's current proxy history list and index `N` is the last. The index is the same number everywhere: the paginated list, the regex search, structured filtering, `_by_index`, body and message slices, replay, notes, highlights, Repeater and Intruder all address the same row. A regex hit at index 41 can be passed to any of them unchanged.
 
 Core concepts:
 
-- `index`: stable 1-based pointer into the current history array.
-- `count`: maximum number of records to return.
-- `offset`: 0-based pagination offset for existing paginated tools.
-- `newestFirst`: returns newest entries first without needing to know the final offset.
-- `fields`: optional allowlist for compact output.
+- `index`: global 1-based position in Burp's current history list. Every history tool reports and accepts it.
+- `id`: Burp's own request/response id, reported next to `index` as a second identity.
+- `count`: page size. Between 1 and 500.
+- `offset`: 0-based page offset on the paginated and filtered list tools.
+- `newestFirst`: page from the end without knowing the final index.
+- `fields`: optional allowlist of item keys.
+
+An item is a flat JSON object. Keys: `index`, `id`, `method`, `host`, `port`, `path`, `url`, `time`, `mimeType`, `statusCode`, `requestContentLength`, `responseContentLength`, `notes`, `request`, `response`.
+
+`index` and `id` are always present. Every other key costs work or context, so select it with `fields` when scanning. A missing request or response is JSON `null`; there is no placeholder text.
 
 Do not dump full requests and responses by default. Start with compact fields, then fetch a bounded slice only for the item that matters.
+
+### Output limits
+
+| Limit | Value | Behaviour when exceeded |
+|---|---|---|
+| `count` | 500 | Tool returns an error naming the limit |
+| `length` (`_body`, `_message_slice`) | 200000 characters | Tool returns an error naming the limit |
+| `bodyPreviewLength` (`_with_diff`) | 20000 characters | Tool returns an error naming the limit |
+| One history item | 5000 characters | JSON-valid truncation, long strings end with `... (truncated)` |
+| `send_http1_request`, `send_http2_request`, replay responses | 200000 characters | Truncated with `... (truncated: response was N characters)` |
 
 ## Efficient Agent Workflow
 
@@ -132,23 +147,22 @@ Recommended first call:
 ```json
 {
   "count": 20,
-  "fields": ["method", "path", "host", "statusCode", "contentType", "requestContentLength", "responseContentLength", "hasRequestBody", "hasResponseBody", "notes"]
+  "fields": ["method", "path", "host", "port", "statusCode", "mimeType", "requestContentLength", "responseContentLength", "notes"]
 }
 ```
 
 Good candidate fields:
 
+- `index`, `id` (always included)
 - `method`
 - `path`
 - `host`
+- `port`
 - `statusCode`
-- `contentType`
+- `mimeType`
+- `time`
 - `requestContentLength`
 - `responseContentLength`
-- `hasRequestBody`
-- `hasResponseBody`
-- `requestLine`
-- `responseLine`
 - `notes`
 
 Avoid requesting `request` and `response` for broad history scans. That burns context and hides signal.
@@ -157,7 +171,9 @@ Avoid requesting `request` and `response` for broad history scans. That burns co
 
 ### `get_proxy_http_history_count`
 
-Returns total proxy HTTP history entries. Optional `regex` applies a regex filter.
+Returns the number of proxy HTTP history items, optionally those matching a `regex`. With a regex the number counts **items that contain a match**, not match occurrences.
+
+Burp exposes no count primitive, so this call always builds the history list. It reads no message text.
 
 Use before pagination or when checking if new traffic arrived.
 
@@ -172,24 +188,24 @@ Returns newest proxy HTTP history entries without calculating offsets.
 ```json
 {
   "count": 10,
-  "fields": ["method", "path", "host", "statusCode", "contentType"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType"]
 }
 ```
 
 ### `get_proxy_http_history_by_index`
 
-Fetches exactly one history item by 1-based index.
+Fetches exactly one history item by global 1-based index.
 
 ```json
 {
   "index": 42,
-  "fields": ["method", "path", "host", "statusCode", "requestLine", "responseLine"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType"]
 }
 ```
 
 ### `get_proxy_http_history_since`
 
-Fetches entries added after a known 1-based index.
+Fetches entries added after a known global 1-based index.
 
 ```json
 {
@@ -199,24 +215,29 @@ Fetches entries added after a known 1-based index.
 }
 ```
 
+Output is an envelope: `historySize`, `afterIndex`, `returned`, `nextIndex`, `hasMore`, `historyReset`, `items`. Feed `nextIndex` back in on the following poll. `historyReset` is true when `historySize` is below `afterIndex`, which means Burp's history was cleared or replaced and the stored cursor is stale; rediscover instead of polling.
+
 Use this for polling workflows. Store the last seen index externally, then ask for entries after it.
 
 ### `get_proxy_http_history_filtered`
 
-Filters HTTP history using structured metadata.
+Filters HTTP history on Montoya metadata. No request or response text is materialised, so this is cheap even on a large history.
 
 Parameters:
 
 - `method`
-- `host`
+- `host`: accepted with or without the port (`api.example.test` and `api.example.test:8443` both match)
 - `pathContains`
 - `statusCode`
 - `hasRequestBody`
 - `hasResponseBody`
-- `contentTypeContains`
+- `contentTypeContains`: matches the MIME type or the `Content-Type` header
 - `newestFirst`
+- `offset`
 - `count`
 - `fields`
+
+Output is an envelope: `totalMatches`, `offset`, `returned`, `hasMore`, `items`. A filter with no hits returns `totalMatches: 0` and an empty `items` array, which is not the same as running past the end of a page.
 
 Example, newest JSON POSTs returning server errors:
 
@@ -227,8 +248,9 @@ Example, newest JSON POSTs returning server errors:
   "hasRequestBody": true,
   "contentTypeContains": "json",
   "newestFirst": true,
+  "offset": 0,
   "count": 10,
-  "fields": ["method", "path", "host", "statusCode", "contentType", "requestContentLength"]
+  "fields": ["method", "path", "host", "statusCode", "mimeType", "requestContentLength"]
 }
 ```
 
@@ -238,11 +260,11 @@ Returns a bounded slice from request or response, choosing headers, body, or ful
 
 Parameters:
 
-- `index`: 1-based history index.
+- `index`: global 1-based history index.
 - `message`: `request` or `response`.
 - `part`: `headers`, `body`, or `full`.
-- `offset`: slice offset.
-- `length`: max bytes or characters to return.
+- `offset`: character offset into the selected part.
+- `length`: characters to return, up to 200000. An empty result means the offset is past the end.
 
 Examples:
 
@@ -291,7 +313,9 @@ Example IDOR probe:
 }
 ```
 
-The tool uses the original captured request as the base and sends it through Burp's HTTP stack. It returns the response in serialized form.
+The tool uses the original captured request as the base and sends it through Burp's HTTP stack. A header listed in `replaceHeaders` is updated when the request already carries it and **added** when it does not, so injecting `Authorization` or `Cookie` works.
+
+Replay goes through the same per-target approval gate as `send_http1_request`, evaluated against the mutated request's target, and inherits its auto-approve list. Responses are cut at 200000 characters with the original length appended.
 
 ### `send_http_request_from_history_with_diff`
 
@@ -324,7 +348,7 @@ Output includes:
 - `mutated.statusCode`, `mutated.contentType`, `mutated.bodyLength`, `mutated.bodySha256`, `mutated.headerNames`
 - `delta.statusChanged`, `delta.contentTypeChanged`, `delta.bodyLengthDelta`, `delta.bodyHashChanged`, `delta.similarity`
 - `delta.headerNamesAdded`, `delta.headerNamesRemoved`
-- `preview.firstDifference`
+- `preview.firstDifference`: `bodyOffset` and `previewStart` address the body (`part="body"`), `messageOffset` addresses the full message (`part="full"`)
 
 Prefer this over raw replay when validating a hypothesis. It gives agents deterministic before/after evidence without dumping full bodies.
 
@@ -468,7 +492,7 @@ Follow TDD. Do not wire a tool blind.
 
 Security gates matter:
 
-- History-reading tools should check `HistoryAccessSecurity`.
+- History-reading tools should check `DataAccessSecurity.checkDataAccessPermission(DataAccessType.HTTP_HISTORY, config)` (or `WEBSOCKET_HISTORY`, `ORGANIZER`).
 - Traffic-sending tools should check `HttpRequestSecurity`.
 - Config-editing tools should honor `config.configEditingTooling`.
 
@@ -512,7 +536,7 @@ Security gates matter:
 
 3. **Dumping full history.** Use compact `fields` first. Pull slices only for candidate indexes.
 
-4. **Mixing index and offset.** Agent-facing `index` is 1-based. Pagination `offset` is 0-based.
+4. **Mixing index and offset.** Agent-facing `index` is global 1-based. Pagination `offset` is 0-based.
 
 5. **Assuming latest-first is default.** Existing paginated history tools default to oldest-first unless `newestFirst` is true. `get_latest_proxy_http_history` exists to avoid that mistake.
 
@@ -522,9 +546,11 @@ Security gates matter:
 
 8. **Returning giant bodies from new tools.** Always support bounded output or field selection for anything that can grow.
 
-9. **Trusting stale history indexes after clearing Burp history.** Indexes refer to the current in-memory history list. If history changes drastically, recount and rediscover candidates.
+9. **Trusting stale history indexes after clearing Burp history.** Indexes refer to the current in-memory history list. If history changes drastically, recount and rediscover candidates. `get_proxy_http_history_since` reports `historyReset` when your cursor no longer exists.
 
-10. **Assuming WebSocket parity.** HTTP history has the enhanced workflow. WebSocket is not yet equally capable.
+10. **Assuming a regex hit is index 1.** Regex results carry the same global index as every other tool. Never renumber them by position in the match list.
+
+11. **Assuming WebSocket parity.** HTTP history has the enhanced workflow. WebSocket is not yet equally capable.
 
 ## Verification Checklist
 
