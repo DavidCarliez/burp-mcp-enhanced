@@ -31,7 +31,7 @@ Benchmark: 14 scripted tasks and 18 headless Claude Code runs (6 tasks × 3 runs
 | PortSwigger `mcp-server` 1.3.0 | 14 / 18 | 247 s | 5.58 M | $2.74 |
 | **burp-mcp-enhanced 1.3.0-enhanced.2** | **18 / 18** | **90 s** | **0.46 M** | **$0.44** |
 
-**137× less tool output, 2.7× faster, 12× fewer tokens, 6.2× cheaper, every task correct.** Per-task detail in the grid below; the benchmark's companion write-up is [*Your MCP Server Is Slowing Your Pentest Agent Down*](https://dc-cybersec.com/blog/agentic-pentesting-mcp-benchmark/).
+**137× less tool output, 2.7× faster, 12× fewer tokens, 6.2× cheaper, every task correct.** Per-task detail in the grid below; the companion write-up is [the benchmark blog post](https://dc-cybersec.com/blog/agentic-pentesting-mcp-benchmark/).
 
 ![Tool calls and bytes returned to the model per task, official vs enhanced](https://raw.githubusercontent.com/DavidCarliez/proxy-mcp-bench/main/figures/task-grid.svg)
 
@@ -175,4 +175,4 @@ Forked from `PortSwigger/mcp-server` at `v1.3.0`; upstream history is preserved,
 
 ## Credits
 
-Upstream extension: [PortSwigger/mcp-server](https://github.com/PortSwigger/mcp-server) (GPL-3.0). Benchmark, harness and figures: [DavidCarliez/proxy-mcp-bench](https://github.com/DavidCarliez/proxy-mcp-bench). Written up in [*Your MCP Server Is Slowing Your Pentest Agent Down*](https://dc-cybersec.com/blog/agentic-pentesting-mcp-benchmark/).
+Upstream extension: [PortSwigger/mcp-server](https://github.com/PortSwigger/mcp-server) (GPL-3.0). Benchmark, harness and figures: [DavidCarliez/proxy-mcp-bench](https://github.com/DavidCarliez/proxy-mcp-bench). Written up in [*I benchmarked Burp & Caido MCP servers. They were slowing my agent down, here's how I made them 6x cheaper & 3x faster!*](https://dc-cybersec.com/blog/agentic-pentesting-mcp-benchmark/).
