@@ -54,7 +54,7 @@ At 100,005 requests, the Caido upstream server needed 1,001 calls (10 MB) to fin
 
 ## What this fork adds
 
-16 new tools, all of them pointing at things Burp already exposes. `index` is a **global 1-based position** shared by every tool below: a regex hit at index 41 can be passed unchanged to a slice, a replay or a Repeater handoff. Every row also carries Burp's native `id`.
+16 new tools, all of them pointing at things Burp already exposes. `index` is a **global 1-based position** shared by every tool below: a regex hit at index 41 can be passed unchanged to a slice, a replay or a Repeater handoff. Every HTTP history row also carries Burp's native `id`.
 
 ### Navigation and counting
 
@@ -101,7 +101,7 @@ At 100,005 requests, the Caido upstream server needed 1,001 calls (10 MB) to fin
 
 ## Three bugs this fork had to fix first
 
-The first version of the fork was worse than upstream on two benchmark tasks. Recorded tool traces showed why:
+Two results went the wrong way in the first round. The recorded traces, plus a review against upstream, turned up three bugs in the fork:
 
 - **Regex hits were renumbered.** Hits reported their position inside the *filtered list*, so "find, then read" opened the wrong request. Now every hit carries the global index.
 - **Replay dropped injected headers.** `replaceHeaders` only replaced existing keys; an added `Authorization` vanished. Now it adds.
@@ -171,7 +171,7 @@ Show me the last 20 requests to admin.localhost that returned 500.
 
 ## Compatibility
 
-Forked from `PortSwigger/mcp-server` at `v1.3.0`; upstream history is preserved, so rebasing onto later releases is a normal merge. Drop-in: no client changes, no new ports, no config migration. Built and tested against Burp Suite Professional 2026.10.1 and Montoya API 2026.10.
+Forked from `PortSwigger/mcp-server` at `v1.3.0`; upstream history is preserved, so rebasing onto later releases is a normal merge. Drop-in: no client changes, no new ports, no config migration. Built and tested against Burp Suite Professional 2026.10.1 on Montoya API 2025.10, the version upstream `v1.3.0` pins.
 
 ## Credits
 
